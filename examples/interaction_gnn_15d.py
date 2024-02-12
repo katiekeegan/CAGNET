@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.autograd.profiler as profiler
 import torch_geometric
 import torch_geometric.transforms as T
-from torch_geometric.data import Data, Dataset
+from torch_geometric.data import Batch, Data, Dataset
 from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.loader import NeighborSampler
@@ -609,14 +609,34 @@ def main(args, batches=None):
         adj_matrix = edge_index
     elif args.dataset == "physics_ex3":
         print(f"Loading coo...", flush=True)
-        batch = torch.load("/global/homes/a/alokt/data/physics_ex3/batch_10431.pt")
+        # batch = torch.load("/global/homes/a/alokt/data/physics_ex3/batch_10431.pt")
+        train_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/trainset/"
+        directory = os.fsencode(train_dir)
+        batches = []
+        for file in os.listdir(directory):
+            filename = os.fsdecode(file)
+            if filename.endswith(".pyg") and filename.startswith("event["):
+                path = osp.join(train_dir, filename)
+                event_graph = torch.load(path)
+                data_graph = Data(hit_id=event_graph["hit_id"],
+                                    x=event_graph["x"], 
+                                    y=event_graph["y"], 
+                                    z=event_graph["z"], 
+                                    edge_index=event_graph["edge_index"], 
+                                    truth_map=event_graph["truth_map"],
+                                    weight=event_graph["weight"])
+                batches.append(data_graph)
+
+        print(f"batches: {batches}", flush=True)
+        print(f"len(batches): {len(batches)}", flush=True)
+        trainset = Batch.from_data_list(batches)
+        del batches
         print(f"Done loading coo", flush=True)
-        batch = batch.to(device)
-        n = batch.hit_id.size(0)
         num_features = 1
         num_classes = 2
 
-    print(f"batch: {batch}", flush=True)
+    print(f"trainset: {trainset}", flush=True)
+    exit()
 
     row_groups, col_groups = get_proc_groups(rank, size, args.replication)
 
