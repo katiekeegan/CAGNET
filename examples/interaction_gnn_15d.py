@@ -15,7 +15,7 @@ import torch_geometric.transforms as T
 from torch_geometric.data import Batch, Data, Dataset
 from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
-from torch_geometric.loader import NeighborSampler
+from torch_geometric.loader import NeighborSampler, NeighborLoader
 from torch_geometric.utils import add_remaining_self_loops
 import torch_sparse
 
@@ -635,8 +635,9 @@ def main(args, batches=None):
         num_features = 1
         num_classes = 2
 
+        trainset = trainset.to(device)
+
     print(f"trainset: {trainset}", flush=True)
-    exit()
 
     row_groups, col_groups = get_proc_groups(rank, size, args.replication)
 
@@ -666,6 +667,10 @@ def main(args, batches=None):
             amsgrad=True,
         )
 
+    train_loader = NeighborLoader(trainset,  
+                                    num_neighbors=[5,5,5], 
+                                    batch_size=10000, 
+                                    num_workers=1) 
 
     for epoch in range(args.n_epochs):
         print(f"Epoch: {epoch}", flush=True)
@@ -673,7 +678,9 @@ def main(args, batches=None):
             epoch_start = time.time()
 
         model.train()
-        for b in range(0, 1):
+        for batch in train_loader:
+            print(f"batch: {batch}", flush=True)
+            print(f"batch.weight.device: {batch.weight.device}", flush=True)
             optimizer.zero_grad()
             logits = model(batch, epoch)
             loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
