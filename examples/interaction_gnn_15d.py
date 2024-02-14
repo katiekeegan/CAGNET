@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from sparse_coo_tensor_cpp import sort_dst_proc_gpu
 
 import socket
+import yaml
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
@@ -180,6 +181,36 @@ class InteractionGNN(nn.Module):
         print(f"output: {output}", flush=True)
         print(f"output.sum: {output.sum()}", flush=True)
         return output
+
+    def loss_function(self, output, batch):
+        """
+        Applies the loss function to the output of the model and the truth labels.
+        To balance the positive and negative contribution, simply take the means of each separately.
+        Any further fine tuning to the balance of true target, true background and fake can be handled 
+        with the `weighting` config option.
+        """
+
+        assert hasattr(batch, "y"), "The batch does not have a truth label"
+        assert hasattr(batch, "weight"), "The batch does not have a weighting label"
+        
+        # negative_mask = ((batch.y == 0) & (batch.weights != 0)) | (batch.weights < 0) 
+        print(f"batch.y: {batch.y}", flush=True)
+        print(f"batch.weight: {batch.weight}", flush=True)
+        negative_mask = ((batch.y == 0) & (batch.weight != 0)) | (batch.weight < 0) 
+        
+        negative_loss = F.binary_cross_entropy_with_logits(
+            # output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weights[negative_mask].abs()
+            output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weight[negative_mask].abs()
+        )
+
+        # positive_mask = (batch.y == 1) & (batch.weights > 0)
+        positive_mask = (batch.y == 1) & (batch.weight > 0)
+        positive_loss = F.binary_cross_entropy_with_logits(
+            # output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weights[positive_mask].abs()
+            output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weight[positive_mask].abs()
+        )
+
+        return positive_loss + negative_loss
 
     @torch.no_grad()
     def evaluate(self, graph, features, test_idx, labels):
@@ -610,26 +641,48 @@ def main(args, batches=None):
     elif args.dataset == "physics_ex3":
         print(f"Loading coo...", flush=True)
         # batch = torch.load("/global/homes/a/alokt/data/physics_ex3/batch_10431.pt")
-        train_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/trainset/"
-        directory = os.fsencode(train_dir)
-        batches = []
-        for file in os.listdir(directory):
-            filename = os.fsdecode(file)
-            if filename.endswith(".pyg") and filename.startswith("event["):
-                path = osp.join(train_dir, filename)
-                event_graph = torch.load(path)
-                data_graph = Data(hit_id=event_graph["hit_id"],
-                                    x=event_graph["x"], 
-                                    y=event_graph["y"], 
-                                    z=event_graph["z"], 
-                                    edge_index=event_graph["edge_index"], 
-                                    truth_map=event_graph["truth_map"],
-                                    weight=event_graph["weight"])
-                batches.append(data_graph)
+        # train_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/trainset/"
+        # directory = os.fsencode(train_dir)
+        # batches = []
+        # for file in os.listdir(directory):
+        #     filename = os.fsdecode(file)
+        #     if filename.endswith(".pyg") and filename.startswith("event["):
+        #         path = osp.join(train_dir, filename)
+        #         event_graph = torch.load(path)
+        #         data_graph = Data(hit_id=event_graph["hit_id"],
+        #                             x=event_graph["x"], 
+        #                             y=event_graph["y"], 
+        #                             z=event_graph["z"], 
+        #                             edge_index=event_graph["edge_index"], 
+        #                             truth_map=event_graph["truth_map"],
+        #                             weight=event_graph["weight"])
+        #         batches.append(data_graph)
 
-        print(f"batches: {batches}", flush=True)
+        input_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/"
+        with open("gnn_train.yaml") as stream:
+            hparams = yaml.safe_load(stream)
+
+        print(f"hparams: {hparams}", flush=True)
+
+        dataset = GraphDataset(input_dir, "trainset", 80, "fit", hparams)
+
+        print(f"dataset: {dataset}", flush=True)
+        trainset = []
+        for data in dataset:
+            data_obj = Data(hit_id=data["hit_id"],
+                                x=data["x"], 
+                                y=data["y"], 
+                                z=data["z"], 
+                                edge_index=data["edge_index"], 
+                                truth_map=data["truth_map"],
+                                weights=data["weights"])
+
+            trainset.append(data_obj)
+        trainset = Batch.from_data_list(trainset)
+        print(f"trainset: {trainset}", flush=True)
+
+        exit()
         print(f"len(batches): {len(batches)}", flush=True)
-        trainset = Batch.from_data_list(batches)
         del batches
         print(f"Done loading coo", flush=True)
         num_features = 1
@@ -680,16 +733,19 @@ def main(args, batches=None):
         model.train()
         for batch in train_loader:
             print(f"batch: {batch}", flush=True)
-            print(f"batch.weight.device: {batch.weight.device}", flush=True)
+            print(f"batch.edge_index: {batch.edge_index}", flush=True)
             optimizer.zero_grad()
             logits = model(batch, epoch)
-            loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
+            print(f"logits: {logits}", flush=True)
+            # loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
+            loss = model.loss_function(logits, batch)     
+            print(f"loss: {loss}", flush=True)
             loss.backward()
 
     total_stop = time.time()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='GCN')
+    parser = argparse.ArgumentParser(description='IGNN')
     parser.add_argument("--dataset", type=str, default="Cora",
                         help="dataset to train")
     parser.add_argument("--sample-method", type=str, default="ladies",
