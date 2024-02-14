@@ -191,23 +191,17 @@ class InteractionGNN(nn.Module):
         """
 
         assert hasattr(batch, "y"), "The batch does not have a truth label"
-        assert hasattr(batch, "weight"), "The batch does not have a weighting label"
+        assert hasattr(batch, "weights"), "The batch does not have a weighting label"
         
-        # negative_mask = ((batch.y == 0) & (batch.weights != 0)) | (batch.weights < 0) 
-        print(f"batch.y: {batch.y}", flush=True)
-        print(f"batch.weight: {batch.weight}", flush=True)
-        negative_mask = ((batch.y == 0) & (batch.weight != 0)) | (batch.weight < 0) 
+        negative_mask = ((batch.y == 0) & (batch.weights != 0)) | (batch.weights < 0) 
         
         negative_loss = F.binary_cross_entropy_with_logits(
-            # output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weights[negative_mask].abs()
-            output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weight[negative_mask].abs()
+            output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weights[negative_mask].abs()
         )
 
-        # positive_mask = (batch.y == 1) & (batch.weights > 0)
-        positive_mask = (batch.y == 1) & (batch.weight > 0)
+        positive_mask = (batch.y == 1) & (batch.weights > 0)
         positive_loss = F.binary_cross_entropy_with_logits(
-            # output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weights[positive_mask].abs()
-            output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weight[positive_mask].abs()
+            output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weights[positive_mask].abs()
         )
 
         return positive_loss + negative_loss
@@ -640,24 +634,6 @@ def main(args, batches=None):
         adj_matrix = edge_index
     elif args.dataset == "physics_ex3":
         print(f"Loading coo...", flush=True)
-        # batch = torch.load("/global/homes/a/alokt/data/physics_ex3/batch_10431.pt")
-        # train_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/trainset/"
-        # directory = os.fsencode(train_dir)
-        # batches = []
-        # for file in os.listdir(directory):
-        #     filename = os.fsdecode(file)
-        #     if filename.endswith(".pyg") and filename.startswith("event["):
-        #         path = osp.join(train_dir, filename)
-        #         event_graph = torch.load(path)
-        #         data_graph = Data(hit_id=event_graph["hit_id"],
-        #                             x=event_graph["x"], 
-        #                             y=event_graph["y"], 
-        #                             z=event_graph["z"], 
-        #                             edge_index=event_graph["edge_index"], 
-        #                             truth_map=event_graph["truth_map"],
-        #                             weight=event_graph["weight"])
-        #         batches.append(data_graph)
-
         input_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/"
         with open("gnn_train.yaml") as stream:
             hparams = yaml.safe_load(stream)
@@ -679,18 +655,11 @@ def main(args, batches=None):
 
             trainset.append(data_obj)
         trainset = Batch.from_data_list(trainset)
+        trainset = trainset.to(device)
         print(f"trainset: {trainset}", flush=True)
 
-        exit()
-        print(f"len(batches): {len(batches)}", flush=True)
-        del batches
-        print(f"Done loading coo", flush=True)
         num_features = 1
         num_classes = 2
-
-        trainset = trainset.to(device)
-
-    print(f"trainset: {trainset}", flush=True)
 
     row_groups, col_groups = get_proc_groups(rank, size, args.replication)
 
