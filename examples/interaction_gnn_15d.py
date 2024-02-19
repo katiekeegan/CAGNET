@@ -63,9 +63,6 @@ class InteractionGNN(nn.Module):
             batch_norm=False,
         )
         
-        for name, param in self.node_encoder.named_parameters():
-            print(f"node_encoder name: {name} param.sum: {param.sum()}", flush=True)
-
         self.edge_encoder = self.make_mlp(
             2 * n_hidden,
             [n_hidden] * nb_edge_layer,
@@ -73,9 +70,6 @@ class InteractionGNN(nn.Module):
             batch_norm=False,
         )
         
-        for name, param in self.edge_encoder.named_parameters():
-            print(f"edge_encoder name: {name} param.sum: {param.sum()}", flush=True)
-
         self.edge_network = self.make_mlp(
             3 * n_hidden,
             [n_hidden] * nb_edge_layer,
@@ -83,9 +77,6 @@ class InteractionGNN(nn.Module):
             batch_norm=False,
         )
         
-        for name, param in self.edge_network.named_parameters():
-            print(f"edge_network name: {name} param.sum: {param.sum()}", flush=True)
-
         self.node_network = self.make_mlp(
             network_input_size,
             [n_hidden] * nb_node_layer,
@@ -93,9 +84,6 @@ class InteractionGNN(nn.Module):
             batch_norm=False,
         )
         
-        for name, param in self.node_network.named_parameters():
-            print(f"node_network name: {name} param.sum: {param.sum()}", flush=True)
-
         self.output_edge_classifier = self.make_mlp(
             3 * n_hidden,
             [n_hidden] * nb_edge_layer + [1],
@@ -104,10 +92,6 @@ class InteractionGNN(nn.Module):
             output_activation=None,
         )
         
-        for name, param in self.output_edge_classifier.named_parameters():
-            print(f"edge_classifier name: {name} param.sum: {param.sum()}", flush=True)
-
-
     def make_mlp(
         self,
         input_size,
@@ -143,7 +127,6 @@ class InteractionGNN(nn.Module):
         return torch.nn.Sequential(*layers)
 
     def message_step(self, x, start, end, e):
-        print(f"in message step", flush=True)
         # Compute new node features
         edge_messages = torch.cat([
             self.aggregation(e, end, dim_size=x.shape[0]),
@@ -152,8 +135,6 @@ class InteractionGNN(nn.Module):
 
         node_inputs = torch.cat([x, edge_messages], dim=-1)
 
-        print(f"node_network: {self.node_network}", flush=True)
-        print(f"node_inputs.size: {node_inputs.size()}", flush=True)
         x_out = self.node_network(node_inputs)
 
         # Compute new edge features
@@ -177,9 +158,6 @@ class InteractionGNN(nn.Module):
             x, e = self.message_step(x, start, end, e)
 
         output = self.output_step(x, start, end, e)
-        print(f"output.size: {output.size()}", flush=True)
-        print(f"output: {output}", flush=True)
-        print(f"output.sum: {output.sum()}", flush=True)
         return output
 
     def loss_function(self, output, batch):
@@ -701,12 +679,25 @@ def main(args, batches=None):
 
         model.train()
         for batch in train_loader:
+            # frontiers_bulk, adj_matrices_bulk = sage_sampler(g_loc, batches_loc, 
+            #                                                     args.batch_size,
+            #                                                     args.samp_num, 
+            #                                                     args.n_bulkmb,
+            #                                                     args.n_layers, 
+            #                                                     args.n_darts,
+            #                                                     rep_pass, 
+            #                                                     nnz_row_masks, 
+            #                                                     rank, size, row_groups, 
+            #                                                     col_groups, args.timing, 
+            #                                                     args.baseline,
+            #                                                     args.replicate_graph)
+
             print(f"batch: {batch}", flush=True)
             print(f"batch.edge_index: {batch.edge_index}", flush=True)
             optimizer.zero_grad()
             logits = model(batch, epoch)
             print(f"logits: {logits}", flush=True)
-            # loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
+            print(f"logits.sum: {logits.sum()}", flush=True)
             loss = model.loss_function(logits, batch)     
             print(f"loss: {loss}", flush=True)
             loss.backward()
