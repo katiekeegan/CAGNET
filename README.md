@@ -13,7 +13,7 @@ For more information, please read our ACM/IEEE SC'20 paper [Reducing Communicati
 - Python 3.6.10
 - PyTorch 1.3.1
 - PyTorch Geometric (PyG) 1.3.2
-- CUDA 10.1
+- CUDA 10.1.168
 - GCC 6.4.0
 
 On OLCF Summit, all of these dependencies can be accessed with the following
