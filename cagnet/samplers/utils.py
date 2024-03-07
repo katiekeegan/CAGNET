@@ -1079,21 +1079,27 @@ def gen_prob_dist(numerator, adj_matrix, mb_count, node_count_total, replication
     #                                     row_groups, col_groups, "prob", sa_masks, 
     #                                     timing_dict, name)
     if name == "sage" and replicate_graph:
-        matc_chunk_row_lens = torch.cuda.IntTensor(numerator.size(0)).fill_(0)
+        matc_chunk_row_lens = torch.cuda.LongTensor(numerator.size(0)).fill_(0)
         mata_rows = numerator._indices()[0,:]
         mata_cols = numerator._indices()[1,:]
         adj_row_lens = adj_matrix.crow_indices()[1:] - adj_matrix.crow_indices()[:-1]
+        print(f"mata_rows.dtype: {mata_rows.dtype}", flush=True)
+        print(f"matc_chunk_row_lens.dtype: {matc_chunk_row_lens.dtype}", flush=True)
+        print(f"mata_cols.dtype: {mata_cols.dtype}", flush=True)
+        print(f"adj_row_lens.dtype: {adj_row_lens.dtype}", flush=True)
         matc_chunk_row_lens[mata_rows] = adj_row_lens[mata_cols]
-        matc_chunk_crows = torch.cuda.LongTensor(numerator.size(0) + 1).fill_(0)
+        # matc_chunk_crows = torch.cuda.LongTensor(numerator.size(0) + 1).fill_(0)
+        matc_chunk_crows = torch.cuda.IntTensor(numerator.size(0) + 1).fill_(0)
         matc_chunk_crows[1:] = torch.cumsum(matc_chunk_row_lens, 0)
         matc_chunk_crows[0] = 0
         matc_chunk_cols = torch.cuda.IntTensor(matc_chunk_crows[-1].item()).fill_(0)
-        rearrange_rows_gpu(numerator._indices()[0,:], 
-                                numerator._indices()[1,:], 
-                                matc_chunk_crows, 
-                                adj_matrix.crow_indices(), 
-                                adj_matrix.col_indices(), 
+        rearrange_rows_gpu(numerator._indices()[0,:].long(), 
+                                numerator._indices()[1,:].long(), 
+                                matc_chunk_crows.long(), 
+                                adj_matrix.crow_indices().int(), 
+                                adj_matrix.col_indices().int(), 
                                 matc_chunk_cols)
+        matc_chunk_cols = matc_chunk_cols.long()
         # p_num_rows = torch.repeat_interleave(
         #                                 torch.arange(matc_chunk_crows.size(0) - 1, 
         #                                                     dtype=torch.int32, 
@@ -1135,6 +1141,7 @@ def gen_prob_dist(numerator, adj_matrix, mb_count, node_count_total, replication
         # p_num_values = p_num_values.double()
         # p_den = torch.cuda.FloatTensor(numerator.size(0)).fill_(0)
         # p_den = torch.cuda.DoubleTensor(numerator.size(0)).fill_(0)
+        p_num_crows = p_num_crows.long()
         normalize_csr_gpu(p_num_values, p_num_crows, p_num_crows.size(0) - 1)
         p_num_values = torch.nan_to_num(p_num_values)
         p = torch.sparse_csr_tensor(p_num_crows, p_num_cols.long(), p_num_values, torch.Size([numerator.size(0), node_count_total]))

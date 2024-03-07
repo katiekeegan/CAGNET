@@ -79,6 +79,7 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
     #                         batches_expand_idxs,
     #                         batches._values(), 
     #                         size=(mb_count * batch_size, node_count_total))
+    print(f"batches_expand_idxs.dtype: {batches_expand_idxs.dtype}", flush=True)
     batches_expand = sparse_coo_tensor_gpu(batches_expand_idxs, batches._values(), 
                                             torch.Size([mb_count * batch_size, node_count_total]))
 
