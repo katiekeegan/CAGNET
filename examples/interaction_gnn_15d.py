@@ -56,75 +56,133 @@ class InteractionGNN(nn.Module):
         self.aggregation = torch_geometric.nn.aggr.MultiAggregation(aggr_list, mode="cat")
 
         network_input_size = (1 + 2 * len(aggr_list)) * n_hidden
-        self.node_encoder = self.make_mlp(
-            in_feats,
-            [n_hidden] * nb_node_layer,
+
+        self.node_encoder = make_mlp(
+            input_size=in_feats,
+            sizes=[n_hidden] * nb_node_layer,
+            output_activation="TanH",
+            hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
         )
         
-        self.edge_encoder = self.make_mlp(
-            2 * n_hidden,
-            [n_hidden] * nb_edge_layer,
+        self.edge_encoder = make_mlp(
+            input_size=2 * n_hidden,
+            sizes=[n_hidden] * nb_edge_layer,
+            output_activation="TanH",
+            hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
         )
         
-        self.edge_network = self.make_mlp(
-            3 * n_hidden,
-            [n_hidden] * nb_edge_layer,
+        in_edge_net = n_hidden * 6
+        self.edge_network = nn.ModuleList(
+            [
+                make_mlp(
+                    input_size=in_edge_net,
+                    sizes=[n_hidden] * nb_edge_layer,
+                    output_activation="TanH",
+                    hidden_activation="SiLU",
+                    layer_norm=True,
+                    batch_norm=False,
+                )
+                for i in range(hparams["n_graph_iters"])
+            ]
+        )
+        
+        in_node_net = n_hidden * 4
+        self.node_network = nn.ModuleList(
+            [
+                make_mlp(
+                    input_size=in_node_net,
+                    sizes=[n_hidden] * nb_node_layer,
+                    output_activation="TanH",
+                    hidden_activation="SiLU",
+                    layer_norm=True,
+                    batch_norm=False,
+                )
+                for i in range(hparams["n_graph_iters"])
+            ]
+        )
+        
+        # edge decoder
+        self.edge_decoder = make_mlp(
+            input_size=n_hidden,
+            sizes=[n_hidden] * nb_edge_layer,
+            output_activation="TanH",
+            hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
         )
-        
-        self.node_network = self.make_mlp(
-            network_input_size,
-            [n_hidden] * nb_node_layer,
-            layer_norm=True,
-            batch_norm=False,
-        )
-        
-        self.output_edge_classifier = self.make_mlp(
-            3 * n_hidden,
-            [n_hidden] * nb_edge_layer + [1],
-            layer_norm=True,
-            batch_norm=False,
+
+        # edge output transform layer
+        self.edge_output_transform = make_mlp(
+            input_size=n_hidden,
+            sizes=[n_hidden, 1],
             output_activation=None,
+            hidden_activation="SiLU",
+            layer_norm=True,
+            batch_norm=False,
         )
+
+        # dropout layer
+        self.dropout = nn.Dropout(p=0.1)
         
     def make_mlp(
-        self,
         input_size,
         sizes,
-        output_activation=torch.nn.Tanh,
-        hidden_activation=torch.nn.SiLU,
-        layer_norm=False,
-        batch_norm=False,
+        hidden_activation="ReLU",
+        output_activation=None,
+        layer_norm=False,  # TODO : change name to hidden_layer_norm while ensuring backward compatibility
+        output_layer_norm=False,
+        batch_norm=False,  # TODO : change name to hidden_batch_norm while ensuring backward compatibility
+        output_batch_norm=False,
+        input_dropout=0,
+        hidden_dropout=0,
+        track_running_stats=False,
     ):
         """Construct an MLP with specified fully-connected layers."""
-        # if hidden_activation is not None:
-        # hidden_activation = torch.nn.SiLU
-        # output_activation = torch.nn.Tanh
+        hidden_activation = getattr(nn, hidden_activation)
+        if output_activation is not None:
+            output_activation = getattr(nn, output_activation)
         layers = []
         n_layers = len(sizes)
         sizes = [input_size] + sizes
         # Hidden layers
         for i in range(n_layers - 1):
-            layers.append(torch.nn.Linear(sizes[i], sizes[i + 1]))
-            if layer_norm:
-                layers.append(torch.nn.LayerNorm(sizes[i + 1], elementwise_affine=False))
-            if batch_norm:
-                layers.append(torch.nn.BatchNorm1d(sizes[i + 1], track_running_stats=False, affine=False))
+            if i == 0 and input_dropout > 0:
+                layers.append(nn.Dropout(input_dropout))
+            layers.append(nn.Linear(sizes[i], sizes[i + 1]))
+            if layer_norm:  # hidden_layer_norm
+                layers.append(nn.LayerNorm(sizes[i + 1], elementwise_affine=False))
+            if batch_norm:  # hidden_batch_norm
+                layers.append(
+                    nn.BatchNorm1d(
+                        sizes[i + 1],
+                        eps=6e-05,
+                        track_running_stats=track_running_stats,
+                        affine=True,
+                    )  # TODO : Set BatchNorm and LayerNorm parameters in config file ?
+                )
             layers.append(hidden_activation())
+            if hidden_dropout > 0:
+                layers.append(nn.Dropout(hidden_dropout))
         # Final layer
-        layers.append(torch.nn.Linear(sizes[-2], sizes[-1]))
+        layers.append(nn.Linear(sizes[-2], sizes[-1]))
         if output_activation is not None:
-            if layer_norm:
-                layers.append(torch.nn.LayerNorm(sizes[-1], elementwise_affine=False))
-            if batch_norm:
-                layers.append(torch.nn.BatchNorm1d(sizes[-1], track_running_stats=False, affine=False))
+            if output_layer_norm:
+                layers.append(nn.LayerNorm(sizes[-1], elementwise_affine=False))
+            if output_batch_norm:
+                layers.append(
+                    nn.BatchNorm1d(
+                        sizes[-1],
+                        eps=6e-05,
+                        track_running_stats=track_running_stats,
+                        affine=True,
+                    )  # TODO : Set BatchNorm and LayerNorm parameters in config file ?
+                )
             layers.append(output_activation())
-        return torch.nn.Sequential(*layers)
+        return nn.Sequential(*layers)
 
     def message_step(self, x, start, end, e):
         # Compute new node features
@@ -150,15 +208,23 @@ class InteractionGNN(nn.Module):
 
     def forward(self, batch, epoch):
         x = torch.stack([batch["z"]], dim=-1).float()
-        start, end = batch.edge_index
+        src, dst = batch.edge_index
         x.requires_grad = True
         x = self.node_encoder(x)
         e = self.edge_encoder(torch.cat([x[start], x[end]], dim=1))
+        
+        # if concat
+        input_x = x
+        input_e = e
+        outputs = []
         for _ in range(self.n_graph_iters):
-            x, e = self.message_step(x, start, end, e)
+            # if concat
+            x = torch.cat([x, input_x], dim=-1)
+            e = torch.cat([e, input_e], dim=-1)
+            x, e, out = self.message_step(x, e, src, dst)
+            outputs.append(out)
 
-        output = self.output_step(x, start, end, e)
-        return output
+        return outputs[-1].squeeze(-1)
 
     def loss_function(self, output, batch):
         """
@@ -279,116 +345,6 @@ class InteractionGNN(nn.Module):
         #     features = torch.cat(xs, dim=0)
 
         # return features
-
-class LADIES(nn.Module):
-    def __init__(self, in_feats, n_hidden, n_classes, n_layers, aggr, rank, size, partitioning, replication, 
-                                        device, group=None, row_groups=None, col_groups=None):
-        super(LADIES, self).__init__()
-        self.layers = nn.ModuleList()
-        self.n_layers = n_layers
-        self.aggr = aggr
-        self.rank = rank
-        self.size = size
-        self.group = group
-        self.row_groups = row_groups
-        self.col_groups = col_groups
-        self.device = device
-        self.partitioning = partitioning
-        self.replication = replication
-        self.timings = dict()
-
-        self.timings["total"] = []
-        self.timings["sample"] = []
-        self.timings["extract"] = []
-        self.timings["extract-select"] = []
-        self.timings["extract-inst"] = []
-        self.timings["extract-coalesce"] = []
-        self.timings["train"] = []
-        self.timings["selectfeats"] = []
-        self.timings["fwd"] = []
-        self.timings["bwd"] = []
-        self.timings["loss"] = []
-        self.timings["fakemats"] = []
-
-        self.timings["precomp"] = []
-        self.timings["spmm"] = []
-        self.timings["gemm_i"] = []
-        self.timings["gemm_w"] = []
-        self.timings["aggr"] = []
-
-        # # input layer
-        # self.layers.append(GCNConv(in_feats, n_hidden, self.partitioning, self.device))
-        # # hidden layers
-        # for i in range(n_layers - 2):
-        #         self.layers.append(GCNConv(n_hidden, n_hidden, self.partitioning, self.device))
-        # # output layer
-        # self.layers.append(GCNConv(n_hidden, n_classes, self.partitioning, self.device))
-        self.layers.append(GCNConv(in_feats, n_classes, self.partitioning, self.device))
-
-    def forward(self, graphs, inputs, epoch):
-        h = inputs
-        for l, layer in enumerate(self.layers):
-            # graphs[l].t_()
-            # edge_index = graphs[l]._indices()
-            h = layer(self, graphs[l], h, epoch) # GCNConv
-            if l != len(self.layers) - 1:
-                # h = CAGF.relu(h, self.partitioning)
-                h = F.relu(h)
-
-        # h = CAGF.log_softmax(self, h, self.partitioning, dim=1)
-        h = F.log_softmax(h, dim=1)
-        return h
-
-    @torch.no_grad()
-    def evaluate(self, graph, features, test_idx, labels):
-        # subgraph_loader = NeighborSampler(graph, node_idx=None,
-        #                                   sizes=[-1], batch_size=2048,
-        #                                   shuffle=False, num_workers=6)
-
-        # for i in range(self.n_layers):
-        #     xs = []
-        #     for batch_size, n_id, adj in subgraph_loader:
-        #         edge_index, _, size = adj.to(self.device)
-        #         x = features[n_id].to(self.device)
-        #         # edge_index, _, size = adj
-        #         # x = features[n_id]
-        #         # x_target = x[:size[1]]
-        #         # x = self.convs[i]((x, x_target), edge_index)
-        #         x = self.layers[i](x, edge_index)
-        #         if i != self.n_layers - 1:
-        #             x = F.relu(x)
-        #         # xs.append(x)
-        #         xs.append(x[:batch_size])
-
-        #     features = torch.cat(xs, dim=0)
-
-        # return features
-
-        subgraph_loader = NeighborSampler(graph, node_idx=None,
-                                          sizes=[-1], batch_size=2048,
-        # subgraph_loader = NeighborSampler(graph, node_idx=test_idx,
-                                          # sizes=[-1, -1], batch_size=512,
-                                          shuffle=False)
-        non_eval_timings = copy.deepcopy(self.timings)
-        for l, layer in enumerate(self.layers):
-            hs = []
-            for batch_size, n_id, adj in subgraph_loader:
-                # edge_index, _, size = adj.to(self.device)
-                edge_index, _, size = adj
-                adj_batch = torch.sparse_coo_tensor(edge_index, 
-                                                        torch.FloatTensor(edge_index.size(1)).fill_(1.0),
-                                                        size)
-                adj_batch = adj_batch.t().coalesce()
-                h = features[n_id]
-
-                # h = layer(self, adj_batch, h_batch, epoch=-1) # GCNConv
-                h = self.layers[l](h, edge_index)
-                if l != len(self.layers) - 1:
-                    h = CAGF.relu(h, self.partitioning)
-                # hs.append(h) # GCNConv
-                hs.append(h[:batch_size]) # SAGEConv
-            features = torch.cat(hs, dim=0)
-        return features
 
 def get_proc_groups(rank, size, replication):
     rank_c = rank // replication
