@@ -1,7 +1,8 @@
 import math 
 import torch 
 import torch.distributed as dist 
-from torch_geometric.data import Dataset
+import torch_geometric
+from torch_geometric.data import Data, Dataset
 import torch_sparse 
 from collections import defaultdict
 from pathlib import Path
@@ -1645,33 +1646,50 @@ class GraphDataset(Dataset):
     The custom default GNN dataset to load graphs off the disk
     """
 
-    def __init__(self, input_dir, data_name = None, num_events = None, stage="fit", hparams=None, transform=None, pre_transform=None, pre_filter=None):
+    def __init__(
+        self,
+        input_dir,
+        data_name=None,
+        num_events=None,
+        stage="fit",
+        hparams=None,
+        transform=None,
+        pre_transform=None,
+        pre_filter=None,
+        preprocess=True,
+    ):
+        if hparams is None:
+            hparams = {}
         super().__init__(input_dir, transform, pre_transform, pre_filter)
-        
+
         self.input_dir = input_dir
         self.data_name = data_name
         self.hparams = hparams
         self.num_events = num_events
         self.stage = stage
-        
-        self.input_paths = load_datafiles_in_dir(self.input_dir, self.data_name, self.num_events)
-        self.input_paths.sort() # We sort here for reproducibility
-        
+        self.preprocess = preprocess
+        self.transform = transform
+
+        self.input_paths = load_datafiles_in_dir(
+            self.input_dir, self.data_name, self.num_events
+        )
+        self.input_paths.sort()  # We sort here for reproducibility
+
     def len(self):
         return len(self.input_paths)
 
     def get(self, idx):
-
         event_path = self.input_paths[idx]
         event = torch.load(event_path, map_location=torch.device("cpu"))
-        #del event.track_edges
-        #event.track_edges=torch.t(event.track_edges)
-        #print("Event: ", event)
-        self.preprocess_event(event)
-        #print(self.hparams["node_features"]) ['r', 'phi', 'z']
-        #event["x"] = torch.stack([event[feature] for feature in self.hparams["node_features"]], dim=-1).float()
-        #event = Data(x=event['x'], edge_index=event['edge_index'],track_edges=event["track_edges"], truth_map=event["truth_map"], y=event["y"])
-        #print("Event:", event_path, event)
+        # convert DataBatch to Data instance because some transformations don't work on DataBatch
+        event = Data(**event.to_dict())
+        if not self.preprocess:
+            return event
+        event = self.preprocess_event(event)
+        # do pyg transformation if a torch_geometric.transforms instance is given
+        if self.transform is not None:
+            event = self.transform(event)
+
         # return (event, event_path) if self.stage == "predict" else event
         return event
 
@@ -1679,92 +1697,151 @@ class GraphDataset(Dataset):
         """
         Process event before it is used in training and validation loops
         """
-        
-        self.apply_hard_cuts(event)
-        self.construct_weighting(event)
-        self.handle_edge_list(event)
-        self.add_edge_features(event)
-        self.scale_features(event)
-        
+        event = self.apply_hard_cuts(event)
+        event = self.construct_weighting(event)
+        event = self.handle_edge_list(event)
+        event = self.scale_features(event)
+        if self.hparams.get("edge_features") is not None:
+            event = self.add_edge_features(
+                event
+            )  # scaling must be done before adding features
+        return event
+
     def apply_hard_cuts(self, event):
         """
-        Apply hard cuts to the event. This is implemented by 
+        Apply hard cuts to the event. This is implemented by
         1. Finding which true edges are from tracks that pass the hard cut.
         2. Pruning the input graph to only include nodes that are connected to these edges.
         """
-        
-        if self.hparams is not None and "hard_cuts" in self.hparams.keys() and self.hparams["hard_cuts"]:
-            assert isinstance(self.hparams["hard_cuts"], dict), "Hard cuts must be a dictionary"
+
+        if (
+            self.hparams is not None
+            and "hard_cuts" in self.hparams.keys()
+            and self.hparams["hard_cuts"]
+        ):
+            assert isinstance(
+                self.hparams["hard_cuts"], dict
+            ), "Hard cuts must be a dictionary"
             handle_hard_cuts(event, self.hparams["hard_cuts"])
+
+        return event
 
     def construct_weighting(self, event):
         """
         Construct the weighting for the event
         """
-        
-        assert event.y.shape[0] == event.edge_index.shape[1], f"Input graph has {event.edge_index.shape[1]} edges, but {event.y.shape[0]} truth labels"
+
+        assert event.y.shape[0] == event.edge_index.shape[1], (
+            f"Input graph has {event.edge_index.shape[1]} edges, but"
+            f" {event.y.shape[0]} truth labels"
+        )
 
         if self.hparams is not None and "weighting" in self.hparams.keys():
-            assert isinstance(self.hparams["weighting"], list) & isinstance(self.hparams["weighting"][0], dict), "Weighting must be a list of dictionaries"
+            assert isinstance(self.hparams["weighting"], list) & isinstance(
+                self.hparams["weighting"][0], dict
+            ), "Weighting must be a list of dictionaries"
             event.weights = handle_weighting(event, self.hparams["weighting"])
         else:
             event.weights = torch.ones_like(event.y, dtype=torch.float32)
-            
-    def handle_edge_list(self, event):
 
-        if "input_cut" in self.hparams.keys() and self.hparams["input_cut"] and "scores" in event.keys:
+        return event
+
+    def handle_edge_list(self, event):
+        if (
+            "input_cut" in self.hparams.keys()
+            and self.hparams["input_cut"]
+            and "scores" in event.keys()
+        ):
             # Apply a score cut to the event
             self.apply_score_cut(event, self.hparams["input_cut"])
 
         # if "undirected" in self.hparams.keys() and self.hparams["undirected"]:
         #     # Flip event.edge_index and concat together
         #     self.to_undirected(event)
-            
-    
+        return event
+
     def to_undirected(self, event):
         """
         Add the reverse of the edge_index to the event. This then requires all edge features to be duplicated.
         Additionally, the truth map must be duplicated.
         """
-
         num_edges = event.edge_index.shape[1]
         # Flip event.edge_index and concat together
-        event.edge_index = torch.cat([event.edge_index, event.edge_index.flip(0)], dim=1)
+        event.edge_index = torch.cat(
+            [event.edge_index, event.edge_index.flip(0)], dim=1
+        )
         # event.edge_index, unique_edge_indices = torch.unique(event.edge_index, dim=1, return_inverse=True)
+        num_track_edges = event.track_edges.shape[1]
+        event.track_edges = torch.cat(
+            [event.track_edges, event.track_edges.flip(0)], dim=1
+        )
 
         # Concat all edge-like features together
-        for key in event.keys:
-            if isinstance(event[key], torch.Tensor) and ((event[key].shape[0] == num_edges)):
+        for key in get_pyg_data_keys(event):
+            if key == "truth_map":
+                continue
+            if not isinstance(event[key], torch.Tensor) or not event[key].shape:
+                continue
+            if event[key].shape[0] == num_edges:
                 event[key] = torch.cat([event[key], event[key]], dim=0)
-                # event[key] = torch.zeros_like(event.edge_index[0], dtype=event[key].dtype).scatter(0, unique_edge_indices, event[key])
+            elif event[key].shape[0] == num_track_edges:
+                event[key] = torch.cat([event[key], event[key]], dim=0)
 
+        # handle truth_map separately
+        truth_map = event.truth_map.clone()
+        truth_map[truth_map >= 0] = truth_map[truth_map >= 0] + num_edges
+        event.truth_map = torch.cat([event.truth_map, truth_map], dim=0)
+
+        return event
 
     def add_edge_features(self, event):
         if "edge_features" in self.hparams.keys():
-            assert isinstance(self.hparams["edge_features"], list), "Edge features must be a list of strings"
+            assert isinstance(
+                self.hparams["edge_features"], list
+            ), "Edge features must be a list of strings"
             handle_edge_features(event, self.hparams["edge_features"])
+        return event
 
     def scale_features(self, event):
         """
         Handle feature scaling for the event
         """
-        
-        if self.hparams is not None and "node_scales" in self.hparams.keys() and "node_features" in self.hparams.keys():
-            assert isinstance(self.hparams["node_scales"], list), "Feature scaling must be a list of ints or floats"
+
+        if (
+            self.hparams is not None
+            and "node_scales" in self.hparams.keys()
+            and "node_features" in self.hparams.keys()
+        ):
+            assert isinstance(
+                self.hparams["node_scales"], list
+            ), "Feature scaling must be a list of ints or floats"
             for i, feature in enumerate(self.hparams["node_features"]):
-                assert feature in event.keys, f"Feature {feature} not found in event"
+                assert feature in get_pyg_data_keys(
+                    event
+                ), f"Feature {feature} not found in event"
                 event[feature] = event[feature] / self.hparams["node_scales"][i]
- 
+
+        return event
+
     def unscale_features(self, event):
         """
         Unscale features when doing prediction
         """
-        
-        if self.hparams is not None and "node_scales" in self.hparams.keys() and "node_features" in self.hparams.keys():
-            assert isinstance(self.hparams["node_scales"], list), "Feature scaling must be a list of ints or floats"
+
+        if (
+            self.hparams is not None
+            and "node_scales" in self.hparams.keys()
+            and "node_features" in self.hparams.keys()
+        ):
+            assert isinstance(
+                self.hparams["node_scales"], list
+            ), "Feature scaling must be a list of ints or floats"
             for i, feature in enumerate(self.hparams["node_features"]):
-                assert feature in event.keys, f"Feature {feature} not found in event"
+                assert feature in get_pyg_data_keys(
+                    event
+                ), f"Feature {feature} not found in event"
                 event[feature] = event[feature] * self.hparams["node_scales"][i]
+        return event
 
     def apply_score_cut(self, event, score_cut):
         """
@@ -1772,78 +1849,127 @@ class GraphDataset(Dataset):
         """
         passing_edges_mask = event.scores >= score_cut
         num_edges = event.edge_index.shape[1]
-        for key in event.keys:
-            if isinstance(event[key], torch.Tensor) and event[key].shape and (event[key].shape[0] == num_edges or event[key].shape[-1] == num_edges):
+        for key in get_pyg_data_keys(event):
+            if (
+                isinstance(event[key], torch.Tensor)
+                and event[key].shape
+                and (
+                    event[key].shape[0] == num_edges
+                    or event[key].shape[-1] == num_edges
+                )
+            ):
                 event[key] = event[key][..., passing_edges_mask]
 
         remap_from_mask(event, passing_edges_mask)
+        return event
 
-def load_datafiles_in_dir(input_dir, data_name = None, data_num = None):
+    def get_y_node(self, event):
+        y_node = torch.zeros(event.z.size(0))
+        y_node[event.track_edges.view(-1)] = 1
+        event.y_node = y_node
+        return event
 
+def load_datafiles_in_dir(input_dir, data_name=None, data_num=None):
     if data_name is not None:
         input_dir = os.path.join(input_dir, data_name)
 
     data_files = [str(path) for path in Path(input_dir).rglob("*.pyg")][:data_num]
     assert len(data_files) > 0, f"No data files found in {input_dir}"
     if data_num is not None:
-        assert len(data_files) == data_num, f"Number of data files found ({len(data_files)}) is less than the number requested ({data_num})"
+        assert len(data_files) == data_num, (
+            f"Number of data files found ({len(data_files)}) is less than the number"
+            f" requested ({data_num})"
+        )
 
     return data_files
 
 def handle_hard_cuts(event, hard_cuts_config):
-
     true_track_mask = torch.ones_like(event.truth_map, dtype=torch.bool)
 
     for condition_key, condition_val in hard_cuts_config.items():
-        assert condition_key in event.keys, f"Condition key {condition_key} not found in event keys {event.keys}"
+        assert condition_key in get_pyg_data_keys(
+            event
+        ), f"Condition key {condition_key} not found in event keys {get_pyg_data_keys(event)}"
         condition_lambda = get_condition_lambda(condition_key, condition_val)
         value_mask = condition_lambda(event)
         true_track_mask = true_track_mask * value_mask
 
-    graph_mask = torch.isin(event.edge_index, event.track_edges[:, true_track_mask]).all(0)
+    graph_mask = torch.isin(
+        event.edge_index, event.track_edges[:, true_track_mask]
+    ).all(0)
     remap_from_mask(event, graph_mask)
 
     num_edges = event.edge_index.shape[1]
-    for edge_key in event.keys:
-        if isinstance(event[edge_key], torch.Tensor) and num_edges in event[edge_key].shape:
+    for edge_key in get_pyg_data_keys(event):
+        if (
+            isinstance(event[edge_key], torch.Tensor)
+            and num_edges in event[edge_key].shape
+        ):
             event[edge_key] = event[edge_key][..., graph_mask]
 
     num_track_edges = event.track_edges.shape[1]
-    for track_feature in event.keys:
-        if isinstance(event[track_feature], torch.Tensor) and num_track_edges in event[track_feature].shape:
+    for track_feature in get_pyg_data_keys(event):
+        if (
+            isinstance(event[track_feature], torch.Tensor)
+            and num_track_edges in event[track_feature].shape
+        ):
             event[track_feature] = event[track_feature][..., true_track_mask]
 
-def get_condition_lambda(condition_key, condition_val):
+def get_pyg_data_keys(event: Data):
+    """
+    Get the keys of the pyG data object.
+    """
+    if torch_geometric.__version__ < "2.4.0":
+        return event.keys
+    else:
+        return event.keys()
 
+def get_condition_lambda(condition_key, condition_val):
     condition_dict = {
         "is": lambda event: event[condition_key] == condition_val,
         "is_not": lambda event: event[condition_key] != condition_val,
-        "in": lambda event: torch.isin(event[condition_key], torch.tensor(condition_val[1], device=event[condition_key].device)),
-        "not_in": lambda event: ~torch.isin(event[condition_key], torch.tensor(condition_val[1], device=event[condition_key].device)),
-        "within": lambda event: (condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1]),
-        "not_within": lambda event: not ((condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1])),
+        "in": lambda event: torch.isin(
+            event[condition_key],
+            torch.tensor(condition_val[1], device=event[condition_key].device),
+        ),
+        "not_in": lambda event: ~torch.isin(
+            event[condition_key],
+            torch.tensor(condition_val[1], device=event[condition_key].device),
+        ),
+        "within": lambda event: (condition_val[0] <= event[condition_key].float())
+        & (event[condition_key].float() <= condition_val[1]),
+        "not_within": lambda event: not (
+            (condition_val[0] <= event[condition_key].float())
+            & (event[condition_key].float() <= condition_val[1])
+        ),
     }
 
     if isinstance(condition_val, bool):
         return lambda event: event[condition_key] == condition_val
     elif isinstance(condition_val, list) and not isinstance(condition_val[0], str):
-        return lambda event: (condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1])
+        return lambda event: (condition_val[0] <= event[condition_key].float()) & (
+            event[condition_key].float() <= condition_val[1]
+        )
     elif isinstance(condition_val, list):
         return condition_dict[condition_val[0]]
     else:
         raise ValueError(f"Condition {condition_val} not recognised")
 
 def remap_from_mask(event, edge_mask):
-    """ 
+    """
     Takes a mask applied to the edge_index tensor, and remaps the truth_map tensor indices to match.
     """
 
     truth_map_to_edges = torch.ones(edge_mask.shape[0], dtype=torch.long) * -1
-    truth_map_to_edges[event.truth_map[event.truth_map >= 0]] = torch.arange(event.truth_map.shape[0])[event.truth_map >= 0]
+    truth_map_to_edges[event.truth_map[event.truth_map >= 0]] = torch.arange(
+        event.truth_map.shape[0]
+    )[event.truth_map >= 0]
     truth_map_to_edges = truth_map_to_edges[edge_mask]
 
     new_map = torch.ones(event.truth_map.shape[0], dtype=torch.long) * -1
-    new_map[truth_map_to_edges[truth_map_to_edges >= 0]] = torch.arange(truth_map_to_edges.shape[0])[truth_map_to_edges >= 0]
+    new_map[truth_map_to_edges[truth_map_to_edges >= 0]] = torch.arange(
+        truth_map_to_edges.shape[0]
+    )[truth_map_to_edges >= 0]
     event.truth_map = new_map.to(event.truth_map.device)
 
 def handle_weighting(event, weighting_config):
@@ -1876,37 +2002,50 @@ def handle_weighting(event, weighting_config):
     return weights
 
 def get_weight_mask(event, weight_conditions):
-
     graph_mask = torch.ones_like(event.y)
 
     for condition_key, condition_val in weight_conditions.items():
-        assert condition_key in event.keys, f"Condition key {condition_key} not found in event keys {event.keys}"
+        assert condition_key in get_pyg_data_keys(
+            event
+        ), f"Condition key {condition_key} not found in event keys {get_pyg_data_keys(event)}"
         condition_lambda = get_condition_lambda(condition_key, condition_val)
         value_mask = condition_lambda(event)
-        graph_mask = graph_mask * map_tensor_handler(value_mask, output_type="edge-like", num_nodes = event.num_nodes, edge_index = event.edge_index, truth_map = event.truth_map)
+        graph_mask = graph_mask * map_tensor_handler(
+            value_mask,
+            output_type="edge-like",
+            num_nodes=event.num_nodes,
+            edge_index=event.edge_index,
+            truth_map=event.truth_map,
+        )
 
     return graph_mask
 
-def map_tensor_handler(input_tensor: torch.Tensor, 
-                       output_type: str, 
-                       input_type: str = None, 
-                       truth_map: torch.Tensor = None, 
-                       edge_index: torch.Tensor = None,
-                       track_edges: torch.Tensor = None,
-                       num_nodes: int = None, 
-                       num_edges: int = None, 
-                       num_track_edges: int = None,
-                       aggr: str = None):
+def map_tensor_handler(
+    input_tensor: torch.Tensor,
+    output_type: str,
+    input_type: str = None,
+    truth_map: torch.Tensor = None,
+    edge_index: torch.Tensor = None,
+    track_edges: torch.Tensor = None,
+    num_nodes: int = None,
+    num_edges: int = None,
+    num_track_edges: int = None,
+    aggr: str = None,
+):
     """
-    A general function to handle arbitrary maps of one tensor type to another. Types are "node-like", "edge-like" and "track-like".
-    - Node-like: The input tensor is of the same size as the number of nodes in the graph
-    - Edge-like: The input tensor is of the same size as the number of edges in the graph, that is, the *constructed* graph
-    - Track-like: The input tensor is of the same size as the number of true track edges in the event, that is, the *truth* graph
+    A general function to handle arbitrary maps of one tensor type to another
+    Types are "node-like", "edge-like" and "track-like".
+    - node-like: The input tensor is of the same size as the 
+        number of nodes in the graph
+    - edge-like: The input tensor is of the same size as the 
+        number of edges in the graph, that is, the *constructed* graph
+    - track-like: The input tensor is of the same size as the 
+        number of true track edges in the event, that is, the *truth* graph
 
     To visualize:
                     (n)
                      ^
-                    / \ 
+                    / \
       edge_to_node /   \ track_to_node
                   /     \
                  /       \
@@ -1915,30 +2054,27 @@ def map_tensor_handler(input_tensor: torch.Tensor,
               /             \
 node_to_edge /               \ node_to_track
             /                 \
-           |                   | 
            v     edge_to_track v
           (e) <-------------> (t)
             track_to_edge
 
     Args:
         input_tensor (torch.Tensor): The input tensor to be mapped
-        output_type (str): The type of the output tensor. One of "node-like", "edge-like" or "track-like"
-        input_type (str, optional): The type of the input tensor. One of "node-like", "edge-like" or "track-like". Defaults to None, and will try to infer the type from the input tensor, if num_nodes and/or num_edges are provided.
-        truth_map (torch.Tensor, optional): The truth map tensor. Defaults to None. Used for mappings to/from track-like tensors.
-        num_nodes (int, optional): The number of nodes in the graph. Defaults to None. Used for inferring the input type.
-        num_edges (int, optional): The number of edges in the graph. Defaults to None. Used for inferring the input type.
-        num_track_edges (int, optional): The number of track edges in the graph. Defaults to None. Used for inferring the input type.
+        output_type (str): The type of the output tensor. 
+            One of "node-like", "edge-like" or "track-like"
+        input_type (str, optional): The type of the input tensor. 
+            One of "node-like", "edge-like" or "track-like". Defaults to None,
+            and will try to infer the type from the input tensor, if num_nodes
+            and/or num_edges are provided.
+        truth_map (torch.Tensor, optional): The truth map tensor. 
+            Defaults to None. Used for mappings to/from track-like tensors.
+        num_nodes (int, optional): The number of nodes in the graph. 
+            Defaults to None. Used for inferring the input type.
+        num_edges (int, optional): The number of edges in the graph. 
+            Defaults to None. Used for inferring the input type.
+        num_track_edges (int, optional): The number of track edges in the graph 
+            Defaults to None. Used for inferring the input type.
     """
-
-    # Refactor the above switch case into a dictionary
-    mapping_dict = {
-        ("node-like", "edge-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_nodes_to_edges(input_tensor, edge_index, aggr),
-        ("edge-like", "node-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_edges_to_nodes(input_tensor, edge_index, aggr, num_nodes),
-        ("node-like", "track-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_nodes_to_tracks(input_tensor, track_edges, aggr),
-        ("track-like", "node-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_tracks_to_nodes(input_tensor, track_edges, aggr, num_nodes),
-        ("edge-like", "track-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_edges_to_tracks(input_tensor, truth_map),
-        ("track-like", "edge-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_tracks_to_edges(input_tensor, truth_map, num_edges),
-    }
 
     if num_track_edges is None and truth_map is not None:
         num_track_edges = truth_map.shape[0]
@@ -1947,33 +2083,162 @@ node_to_edge /               \ node_to_track
     if num_edges is None and edge_index is not None:
         num_edges = edge_index.shape[1]
     if input_type is None:
-        input_type, input_tensor = infer_input_type(input_tensor, num_nodes, num_edges, num_track_edges)
-
+        input_type, input_tensor = infer_input_type(
+            input_tensor, num_nodes, num_edges, num_track_edges
+        )
     if input_type == output_type:
         return input_tensor
-    elif (input_type, output_type) in mapping_dict:
-        return mapping_dict[(input_type, output_type)](input_tensor, truth_map, edge_index, track_edges, num_nodes, num_edges, num_track_edges, aggr)
-    else:
+
+    input_args = {
+        "truth_map": truth_map,
+        "edge_index": edge_index,
+        "track_edges": track_edges,
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
+        "num_track_edges": num_track_edges,
+        "aggr": aggr,
+    }
+
+    mapping_functions = {
+        ("node-like", "edge-like"): map_nodes_to_edges,
+        ("edge-like", "node-like"): map_edges_to_nodes,
+        ("node-like", "track-like"): map_nodes_to_tracks,
+        ("track-like", "node-like"): map_tracks_to_nodes,
+        ("edge-like", "track-like"): map_edges_to_tracks,
+        ("track-like", "edge-like"): map_tracks_to_edges,
+    }
+    if (input_type, output_type) not in mapping_functions:
         raise ValueError(f"Mapping from {input_type} to {output_type} not supported")
 
-def infer_input_type(input_tensor: torch.Tensor, num_nodes: int = None, num_edges: int = None, num_track_edges: int = None):
+    return mapping_functions[(input_type, output_type)](input_tensor, **input_args)
+
+# Returns string and tensor
+def infer_input_type(
+    input_tensor: torch.Tensor,
+    num_nodes: int = None,
+    num_edges: int = None,
+    num_track_edges: int = None,
+) -> (str, torch.Tensor):
     """
-    Tries to infer the input type from the input tensor and the number of nodes, edges and track-edges in the graph.
-    If the input tensor cannot be matched to any of the provided types, it is assumed to be node-like.
+    Infers the type of the input tensor based on its shape and the provided number of nodes, edges, and track edges.
+
+    Args:
+        input_tensor (torch.Tensor): The tensor whose type needs to be inferred.
+        num_nodes (int, optional): Number of nodes in the graph.
+        num_edges (int, optional): Number of edges in the graph.
+        num_track_edges (int, optional): Number of track edges in the graph.
+
+    Returns:
+        str: The inferred type of the input tensor. One of ["node-like", "edge-like", "track-like"].
     """
+
+    NODE_LIKE = "node-like"
+    EDGE_LIKE = "edge-like"
+    TRACK_LIKE = "track-like"
 
     if num_nodes is not None and input_tensor.shape[0] == num_nodes:
-        return "node-like", input_tensor
+        return NODE_LIKE, input_tensor
     elif num_edges is not None and num_edges in input_tensor.shape:
-        return "edge-like", input_tensor
+        return EDGE_LIKE, input_tensor
     elif num_track_edges is not None and num_track_edges in input_tensor.shape:
-        return "track-like", input_tensor
-    elif num_track_edges is not None and num_track_edges//2 in input_tensor.shape:
-        return "track-like", torch.cat([input_tensor, input_tensor], dim=0)
+        return TRACK_LIKE, input_tensor
+    elif num_track_edges is not None and num_track_edges // 2 in input_tensor.shape:
+        return TRACK_LIKE, torch.cat([input_tensor, input_tensor], dim=0)
     else:
-        return "node-like", input_tensor
+        raise ValueError("Unable to infer the type of the input tensor.")
 
-def map_tracks_to_edges(tracklike_input: torch.Tensor, truth_map: torch.Tensor, num_edges: int = None):
+def map_nodes_to_edges(
+    nodelike_input: torch.Tensor, edge_index: torch.Tensor, aggr: str = None, **kwargs
+):
+    """
+    Map a node-like tensor to an edge-like tensor. If the aggregation is None, this is simply done by sending node values to the edges, thus returning a tensor of shape (2, num_edges).
+    If the aggregation is not None, the node values are aggregated to the edges, and the resulting tensor is of shape (num_edges,).
+    """
+
+    if aggr is None:
+        return nodelike_input[edge_index]
+
+    edgelike_tensor = nodelike_input[edge_index]
+    torch_aggr = getattr(torch, aggr)
+    return torch_aggr(edgelike_tensor, dim=0)
+
+def map_edges_to_nodes(
+    edgelike_input: torch.Tensor,
+    edge_index: torch.Tensor,
+    aggr: str = None,
+    num_nodes: int = None,
+    **kwargs,
+):
+    """
+    Map an edge-like tensor to a node-like tensor. If the aggregation is None, this is simply done by sending edge values to the nodes, thus returning a tensor of shape (num_nodes,).
+    If the aggregation is not None, the edge values are aggregated to the nodes at the destination node (edge_index[1]), and the resulting tensor is of shape (num_nodes,).
+    """
+
+    if num_nodes is None:
+        num_nodes = int(edge_index.max().item() + 1)
+
+    if aggr is None:
+        nodelike_output = torch.zeros(
+            num_nodes, dtype=edgelike_input.dtype, device=edgelike_input.device
+        )
+        nodelike_output[edge_index] = edgelike_input
+        return nodelike_output
+
+    return scatter(
+        edgelike_input, edge_index[1], dim=0, dim_size=num_nodes, reduce=aggr
+    )
+
+def map_nodes_to_tracks(
+    nodelike_input: torch.Tensor, track_edges: torch.Tensor, aggr: str = None, **kwargs
+):
+    """
+    Map a node-like tensor to a track-like tensor. If the aggregation is None, this is simply done by sending node values to the tracks, thus returning a tensor of shape (2, num_track_edges).
+    If the aggregation is not None, the node values are aggregated to the tracks, and the resulting tensor is of shape (num_track_edges,).
+    """
+
+    if aggr is None:
+        return nodelike_input[track_edges]
+
+    tracklike_tensor = nodelike_input[track_edges]
+    torch_aggr = getattr(torch, aggr)
+    return torch_aggr(tracklike_tensor, dim=0)
+
+def map_tracks_to_nodes(
+    tracklike_input: torch.Tensor,
+    track_edges: torch.Tensor,
+    aggr: str = None,
+    num_nodes: int = None,
+    **kwargs,
+):
+    """
+    Map a track-like tensor to a node-like tensor. If the aggregation is None, this is simply done by sending track values to the nodes, thus returning a tensor of shape (num_nodes,).
+    If the aggregation is not None, the track values are aggregated to the nodes at the destination node (track_edges[1]), and the resulting tensor is of shape (num_nodes,).
+    """
+
+    if num_nodes is None:
+        num_nodes = int(track_edges.max().item() + 1)
+
+    if aggr is None:
+        nodelike_output = torch.zeros(
+            num_nodes, dtype=tracklike_input.dtype, device=tracklike_input.device
+        )
+        nodelike_output[track_edges] = tracklike_input
+        return nodelike_output
+
+    return scatter(
+        tracklike_input.repeat(2),
+        torch.cat([track_edges[0], track_edges[1]]),
+        dim=0,
+        dim_size=num_nodes,
+        reduce=aggr,
+    )
+
+def map_tracks_to_edges(
+    tracklike_input: torch.Tensor,
+    truth_map: torch.Tensor,
+    num_edges: int = None,
+    **kwargs,
+):
     """
     Map an track-like tensor to a edge-like tensor. This is done by sending the track value through the truth map, where the truth map is >= 0. Note that where truth_map == -1,
     the true edge has not been constructed in the edge_index. In that case, the value is set to NaN.
@@ -1981,7 +2246,369 @@ def map_tracks_to_edges(tracklike_input: torch.Tensor, truth_map: torch.Tensor, 
 
     if num_edges is None:
         num_edges = int(truth_map.max().item() + 1)
-    edgelike_output = torch.zeros(num_edges, dtype=tracklike_input.dtype, device=tracklike_input.device)
+    edgelike_output = torch.zeros(
+        num_edges, dtype=tracklike_input.dtype, device=tracklike_input.device
+    )
     edgelike_output[truth_map[truth_map >= 0]] = tracklike_input[truth_map >= 0]
     edgelike_output[truth_map[truth_map == -1]] = float("nan")
     return edgelike_output
+
+
+def map_edges_to_tracks(
+    edgelike_input: torch.Tensor, truth_map: torch.Tensor, **kwargs
+):
+    """
+    TODO: Implement this. I don't think it is a meaningful operation, but it is needed for completeness.
+    """
+    raise NotImplementedError(
+        "This is not a meaningful operation, but it is needed for completeness"
+    )
+
+# class GraphDataset(Dataset):
+#     """
+#     The custom default GNN dataset to load graphs off the disk
+#     """
+# 
+#     def __init__(self, input_dir, data_name = None, num_events = None, stage="fit", hparams=None, transform=None, pre_transform=None, pre_filter=None):
+#         super().__init__(input_dir, transform, pre_transform, pre_filter)
+#         
+#         self.input_dir = input_dir
+#         self.data_name = data_name
+#         self.hparams = hparams
+#         self.num_events = num_events
+#         self.stage = stage
+#         
+#         self.input_paths = load_datafiles_in_dir(self.input_dir, self.data_name, self.num_events)
+#         self.input_paths.sort() # We sort here for reproducibility
+#         
+#     def len(self):
+#         return len(self.input_paths)
+# 
+#     def get(self, idx):
+# 
+#         event_path = self.input_paths[idx]
+#         event = torch.load(event_path, map_location=torch.device("cpu"))
+#         #del event.track_edges
+#         #event.track_edges=torch.t(event.track_edges)
+#         #print("Event: ", event)
+#         self.preprocess_event(event)
+#         #print(self.hparams["node_features"]) ['r', 'phi', 'z']
+#         #event["x"] = torch.stack([event[feature] for feature in self.hparams["node_features"]], dim=-1).float()
+#         #event = Data(x=event['x'], edge_index=event['edge_index'],track_edges=event["track_edges"], truth_map=event["truth_map"], y=event["y"])
+#         #print("Event:", event_path, event)
+#         # return (event, event_path) if self.stage == "predict" else event
+#         return event
+# 
+#     def preprocess_event(self, event):
+#         """
+#         Process event before it is used in training and validation loops
+#         """
+#         
+#         print(f"preprocessing event", flush=True)
+#         self.apply_hard_cuts(event)
+#         self.construct_weighting(event)
+#         self.handle_edge_list(event)
+#         self.add_edge_features(event)
+#         self.scale_features(event)
+#         
+#     def apply_hard_cuts(self, event):
+#         """
+#         Apply hard cuts to the event. This is implemented by 
+#         1. Finding which true edges are from tracks that pass the hard cut.
+#         2. Pruning the input graph to only include nodes that are connected to these edges.
+#         """
+#         
+#         if self.hparams is not None and "hard_cuts" in self.hparams.keys() and self.hparams["hard_cuts"]:
+#             assert isinstance(self.hparams["hard_cuts"], dict), "Hard cuts must be a dictionary"
+#             handle_hard_cuts(event, self.hparams["hard_cuts"])
+# 
+#     def construct_weighting(self, event):
+#         """
+#         Construct the weighting for the event
+#         """
+#         
+#         assert event.y.shape[0] == event.edge_index.shape[1], f"Input graph has {event.edge_index.shape[1]} edges, but {event.y.shape[0]} truth labels"
+# 
+#         if self.hparams is not None and "weighting" in self.hparams.keys():
+#             assert isinstance(self.hparams["weighting"], list) & isinstance(self.hparams["weighting"][0], dict), "Weighting must be a list of dictionaries"
+#             event.weights = handle_weighting(event, self.hparams["weighting"])
+#         else:
+#             event.weights = torch.ones_like(event.y, dtype=torch.float32)
+#             
+#     def handle_edge_list(self, event):
+# 
+#         if "input_cut" in self.hparams.keys() and self.hparams["input_cut"] and "scores" in event.keys:
+#             # Apply a score cut to the event
+#             self.apply_score_cut(event, self.hparams["input_cut"])
+# 
+#         # if "undirected" in self.hparams.keys() and self.hparams["undirected"]:
+#         #     # Flip event.edge_index and concat together
+#         #     self.to_undirected(event)
+#             
+#     
+#     def to_undirected(self, event):
+#         """
+#         Add the reverse of the edge_index to the event. This then requires all edge features to be duplicated.
+#         Additionally, the truth map must be duplicated.
+#         """
+# 
+#         num_edges = event.edge_index.shape[1]
+#         # Flip event.edge_index and concat together
+#         event.edge_index = torch.cat([event.edge_index, event.edge_index.flip(0)], dim=1)
+#         # event.edge_index, unique_edge_indices = torch.unique(event.edge_index, dim=1, return_inverse=True)
+# 
+#         # Concat all edge-like features together
+#         for key in event.keys:
+#             if isinstance(event[key], torch.Tensor) and ((event[key].shape[0] == num_edges)):
+#                 event[key] = torch.cat([event[key], event[key]], dim=0)
+#                 # event[key] = torch.zeros_like(event.edge_index[0], dtype=event[key].dtype).scatter(0, unique_edge_indices, event[key])
+# 
+# 
+#     def add_edge_features(self, event):
+#         if "edge_features" in self.hparams.keys():
+#             assert isinstance(self.hparams["edge_features"], list), "Edge features must be a list of strings"
+#             handle_edge_features(event, self.hparams["edge_features"])
+# 
+#     def scale_features(self, event):
+#         """
+#         Handle feature scaling for the event
+#         """
+#         
+#         print(f"hparams: {self.hparams}", flush=True)
+#         if self.hparams is not None and "node_scales" in self.hparams.keys() and "node_features" in self.hparams.keys():
+#             assert isinstance(self.hparams["node_scales"], list), "Feature scaling must be a list of ints or floats"
+#             for i, feature in enumerate(self.hparams["node_features"]):
+#                 assert feature in event.keys, f"Feature {feature} not found in event"
+#                 event[feature] = event[feature] / self.hparams["node_scales"][i]
+#  
+#     def unscale_features(self, event):
+#         """
+#         Unscale features when doing prediction
+#         """
+#         
+#         if self.hparams is not None and "node_scales" in self.hparams.keys() and "node_features" in self.hparams.keys():
+#             assert isinstance(self.hparams["node_scales"], list), "Feature scaling must be a list of ints or floats"
+#             for i, feature in enumerate(self.hparams["node_features"]):
+#                 assert feature in event.keys, f"Feature {feature} not found in event"
+#                 event[feature] = event[feature] * self.hparams["node_scales"][i]
+# 
+#     def apply_score_cut(self, event, score_cut):
+#         """
+#         Apply a score cut to the event. This is used for the evaluation stage.
+#         """
+#         passing_edges_mask = event.scores >= score_cut
+#         num_edges = event.edge_index.shape[1]
+#         for key in event.keys:
+#             if isinstance(event[key], torch.Tensor) and event[key].shape and (event[key].shape[0] == num_edges or event[key].shape[-1] == num_edges):
+#                 event[key] = event[key][..., passing_edges_mask]
+# 
+#         remap_from_mask(event, passing_edges_mask)
+# 
+# def load_datafiles_in_dir(input_dir, data_name = None, data_num = None):
+# 
+#     if data_name is not None:
+#         input_dir = os.path.join(input_dir, data_name)
+# 
+#     data_files = [str(path) for path in Path(input_dir).rglob("*.pyg")][:data_num]
+#     assert len(data_files) > 0, f"No data files found in {input_dir}"
+#     if data_num is not None:
+#         assert len(data_files) == data_num, f"Number of data files found ({len(data_files)}) is less than the number requested ({data_num})"
+# 
+#     return data_files
+# 
+# def handle_hard_cuts(event, hard_cuts_config):
+# 
+#     true_track_mask = torch.ones_like(event.truth_map, dtype=torch.bool)
+# 
+#     print(f"config: {hard_cuts_config}", flush=True)
+#     for condition_key, condition_val in hard_cuts_config.items():
+#         assert condition_key in event.keys, f"Condition key {condition_key} not found in event keys {event.keys}"
+#         condition_lambda = get_condition_lambda(condition_key, condition_val)
+#         value_mask = condition_lambda(event)
+#         true_track_mask = true_track_mask * value_mask
+# 
+#     graph_mask = torch.isin(event.edge_index, event.track_edges[:, true_track_mask]).all(0)
+#     remap_from_mask(event, graph_mask)
+# 
+#     num_edges = event.edge_index.shape[1]
+#     for edge_key in event.keys:
+#         if isinstance(event[edge_key], torch.Tensor) and num_edges in event[edge_key].shape:
+#             event[edge_key] = event[edge_key][..., graph_mask]
+# 
+#     num_track_edges = event.track_edges.shape[1]
+#     for track_feature in event.keys:
+#         if isinstance(event[track_feature], torch.Tensor) and num_track_edges in event[track_feature].shape:
+#             event[track_feature] = event[track_feature][..., true_track_mask]
+# 
+# def get_condition_lambda(condition_key, condition_val):
+# 
+#     condition_dict = {
+#         "is": lambda event: event[condition_key] == condition_val,
+#         "is_not": lambda event: event[condition_key] != condition_val,
+#         "in": lambda event: torch.isin(event[condition_key], torch.tensor(condition_val[1], device=event[condition_key].device)),
+#         "not_in": lambda event: ~torch.isin(event[condition_key], torch.tensor(condition_val[1], device=event[condition_key].device)),
+#         "within": lambda event: (condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1]),
+#         "not_within": lambda event: not ((condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1])),
+#     }
+# 
+#     if isinstance(condition_val, bool):
+#         return lambda event: event[condition_key] == condition_val
+#     elif isinstance(condition_val, list) and not isinstance(condition_val[0], str):
+#         return lambda event: (condition_val[0] <= event[condition_key].float()) & (event[condition_key].float() <= condition_val[1])
+#     elif isinstance(condition_val, list):
+#         return condition_dict[condition_val[0]]
+#     else:
+#         raise ValueError(f"Condition {condition_val} not recognised")
+# 
+# def remap_from_mask(event, edge_mask):
+#     """ 
+#     Takes a mask applied to the edge_index tensor, and remaps the truth_map tensor indices to match.
+#     """
+# 
+#     truth_map_to_edges = torch.ones(edge_mask.shape[0], dtype=torch.long) * -1
+#     truth_map_to_edges[event.truth_map[event.truth_map >= 0]] = torch.arange(event.truth_map.shape[0])[event.truth_map >= 0]
+#     truth_map_to_edges = truth_map_to_edges[edge_mask]
+# 
+#     new_map = torch.ones(event.truth_map.shape[0], dtype=torch.long) * -1
+#     new_map[truth_map_to_edges[truth_map_to_edges >= 0]] = torch.arange(truth_map_to_edges.shape[0])[truth_map_to_edges >= 0]
+#     event.truth_map = new_map.to(event.truth_map.device)
+# 
+# def handle_weighting(event, weighting_config):
+#     """
+#     Take the specification of the weighting and convert this into float values. The default is:
+#     - True edges have weight 1.0
+#     - Negative edges have weight 1.0
+# 
+#     The weighting_config can be used to change this behaviour. For example, we might up-weight target particles - that is edges that pass:
+#     - y == 1
+#     - primary == True
+#     - pt > 1 GeV
+#     - etc. As desired.
+# 
+#     We can also down-weight (i.e. mask) edges that are true, but not of interest. For example, we might mask:
+#     - y == 1
+#     - primary == False
+#     - pt < 1 GeV
+#     - etc. As desired.
+#     """
+# 
+#     # Set the default values, which will be overwritten if specified in the config
+#     weights = torch.zeros_like(event.y, dtype=torch.float)
+#     weights[event.y == 0] = 1.0
+# 
+#     for weight_spec in weighting_config:
+#         weight_val = weight_spec["weight"]
+#         weights[get_weight_mask(event, weight_spec["conditions"])] = weight_val
+# 
+#     return weights
+# 
+# def get_weight_mask(event, weight_conditions):
+# 
+#     graph_mask = torch.ones_like(event.y)
+# 
+#     for condition_key, condition_val in weight_conditions.items():
+#         assert condition_key in event.keys, f"Condition key {condition_key} not found in event keys {event.keys}"
+#         condition_lambda = get_condition_lambda(condition_key, condition_val)
+#         value_mask = condition_lambda(event)
+#         graph_mask = graph_mask * map_tensor_handler(value_mask, output_type="edge-like", num_nodes = event.num_nodes, edge_index = event.edge_index, truth_map = event.truth_map)
+# 
+#     return graph_mask
+# 
+# def map_tensor_handler(input_tensor: torch.Tensor, 
+#                        output_type: str, 
+#                        input_type: str = None, 
+#                        truth_map: torch.Tensor = None, 
+#                        edge_index: torch.Tensor = None,
+#                        track_edges: torch.Tensor = None,
+#                        num_nodes: int = None, 
+#                        num_edges: int = None, 
+#                        num_track_edges: int = None,
+#                        aggr: str = None):
+#     """
+#     A general function to handle arbitrary maps of one tensor type to another. Types are "node-like", "edge-like" and "track-like".
+#     - Node-like: The input tensor is of the same size as the number of nodes in the graph
+#     - Edge-like: The input tensor is of the same size as the number of edges in the graph, that is, the *constructed* graph
+#     - Track-like: The input tensor is of the same size as the number of true track edges in the event, that is, the *truth* graph
+# 
+#     To visualize:
+#                     (n)
+#                      ^
+#                     / \ 
+#       edge_to_node /   \ track_to_node
+#                   /     \
+#                  /       \
+#                 /         \
+#                /           \
+#               /             \
+# node_to_edge /               \ node_to_track
+#             /                 \
+#            |                   | 
+#            v     edge_to_track v
+#           (e) <-------------> (t)
+#             track_to_edge
+# 
+#     Args:
+#         input_tensor (torch.Tensor): The input tensor to be mapped
+#         output_type (str): The type of the output tensor. One of "node-like", "edge-like" or "track-like"
+#         input_type (str, optional): The type of the input tensor. One of "node-like", "edge-like" or "track-like". Defaults to None, and will try to infer the type from the input tensor, if num_nodes and/or num_edges are provided.
+#         truth_map (torch.Tensor, optional): The truth map tensor. Defaults to None. Used for mappings to/from track-like tensors.
+#         num_nodes (int, optional): The number of nodes in the graph. Defaults to None. Used for inferring the input type.
+#         num_edges (int, optional): The number of edges in the graph. Defaults to None. Used for inferring the input type.
+#         num_track_edges (int, optional): The number of track edges in the graph. Defaults to None. Used for inferring the input type.
+#     """
+# 
+#     # Refactor the above switch case into a dictionary
+#     mapping_dict = {
+#         ("node-like", "edge-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_nodes_to_edges(input_tensor, edge_index, aggr),
+#         ("edge-like", "node-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_edges_to_nodes(input_tensor, edge_index, aggr, num_nodes),
+#         ("node-like", "track-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_nodes_to_tracks(input_tensor, track_edges, aggr),
+#         ("track-like", "node-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_tracks_to_nodes(input_tensor, track_edges, aggr, num_nodes),
+#         ("edge-like", "track-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_edges_to_tracks(input_tensor, truth_map),
+#         ("track-like", "edge-like"): lambda input_tensor, truth_map, edge_index, track_index, num_nodes, num_edges, num_track_edges, aggr: map_tracks_to_edges(input_tensor, truth_map, num_edges),
+#     }
+# 
+#     if num_track_edges is None and truth_map is not None:
+#         num_track_edges = truth_map.shape[0]
+#     if num_track_edges is None and track_edges is not None:
+#         num_track_edges = track_edges.shape[1]
+#     if num_edges is None and edge_index is not None:
+#         num_edges = edge_index.shape[1]
+#     if input_type is None:
+#         input_type, input_tensor = infer_input_type(input_tensor, num_nodes, num_edges, num_track_edges)
+# 
+#     if input_type == output_type:
+#         return input_tensor
+#     elif (input_type, output_type) in mapping_dict:
+#         return mapping_dict[(input_type, output_type)](input_tensor, truth_map, edge_index, track_edges, num_nodes, num_edges, num_track_edges, aggr)
+#     else:
+#         raise ValueError(f"Mapping from {input_type} to {output_type} not supported")
+# 
+# def infer_input_type(input_tensor: torch.Tensor, num_nodes: int = None, num_edges: int = None, num_track_edges: int = None):
+#     """
+#     Tries to infer the input type from the input tensor and the number of nodes, edges and track-edges in the graph.
+#     If the input tensor cannot be matched to any of the provided types, it is assumed to be node-like.
+#     """
+# 
+#     if num_nodes is not None and input_tensor.shape[0] == num_nodes:
+#         return "node-like", input_tensor
+#     elif num_edges is not None and num_edges in input_tensor.shape:
+#         return "edge-like", input_tensor
+#     elif num_track_edges is not None and num_track_edges in input_tensor.shape:
+#         return "track-like", input_tensor
+#     elif num_track_edges is not None and num_track_edges//2 in input_tensor.shape:
+#         return "track-like", torch.cat([input_tensor, input_tensor], dim=0)
+#     else:
+#         return "node-like", input_tensor
+# 
+# def map_tracks_to_edges(tracklike_input: torch.Tensor, truth_map: torch.Tensor, num_edges: int = None):
+#     """
+#     Map an track-like tensor to a edge-like tensor. This is done by sending the track value through the truth map, where the truth map is >= 0. Note that where truth_map == -1,
+#     the true edge has not been constructed in the edge_index. In that case, the value is set to NaN.
+#     """
+# 
+#     if num_edges is None:
+#         num_edges = int(truth_map.max().item() + 1)
+#     edgelike_output = torch.zeros(num_edges, dtype=tracklike_input.dtype, device=tracklike_input.device)
+#     edgelike_output[truth_map[truth_map >= 0]] = tracklike_input[truth_map >= 0]
+#     edgelike_output[truth_map[truth_map == -1]] = float("nan")
+#     return edgelike_output

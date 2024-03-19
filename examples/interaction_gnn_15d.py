@@ -16,7 +16,9 @@ from torch_geometric.data import Batch, Data, Dataset
 from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.loader import NeighborSampler, NeighborLoader
+from torch_geometric.loader.shadow import ShaDowKHopSampler
 from torch_geometric.utils import add_remaining_self_loops
+from torch_scatter import scatter_add
 import torch_sparse
 
 from cagnet.nn.conv import GCNConv
@@ -30,6 +32,9 @@ from sparse_coo_tensor_cpp import sort_dst_proc_gpu
 
 import socket
 import yaml
+
+import wandb
+wandb.init(project="exatrkx")
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
@@ -52,24 +57,24 @@ class InteractionGNN(nn.Module):
         self.timings = dict()
 
         torch.manual_seed(0)
-        aggr_list = ["sum", "mean", "max", "std"]
-        self.aggregation = torch_geometric.nn.aggr.MultiAggregation(aggr_list, mode="cat")
+        # aggr_list = ["sum", "mean", "max", "std"]
+        # self.aggregation = torch_geometric.nn.aggr.MultiAggregation(aggr_list, mode="cat")
 
-        network_input_size = (1 + 2 * len(aggr_list)) * n_hidden
+        # network_input_size = (1 + 2 * len(aggr_list)) * n_hidden
 
-        self.node_encoder = make_mlp(
+        self.node_encoder = self.make_mlp(
             input_size=in_feats,
             sizes=[n_hidden] * nb_node_layer,
-            output_activation="TanH",
+            output_activation="Tanh",
             hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
         )
         
-        self.edge_encoder = make_mlp(
+        self.edge_encoder = self.make_mlp(
             input_size=2 * n_hidden,
             sizes=[n_hidden] * nb_edge_layer,
-            output_activation="TanH",
+            output_activation="Tanh",
             hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
@@ -78,45 +83,45 @@ class InteractionGNN(nn.Module):
         in_edge_net = n_hidden * 6
         self.edge_network = nn.ModuleList(
             [
-                make_mlp(
+                self.make_mlp(
                     input_size=in_edge_net,
                     sizes=[n_hidden] * nb_edge_layer,
-                    output_activation="TanH",
+                    output_activation="Tanh",
                     hidden_activation="SiLU",
                     layer_norm=True,
                     batch_norm=False,
                 )
-                for i in range(hparams["n_graph_iters"])
+                for i in range(n_graph_iters)
             ]
         )
         
         in_node_net = n_hidden * 4
         self.node_network = nn.ModuleList(
             [
-                make_mlp(
+                self.make_mlp(
                     input_size=in_node_net,
                     sizes=[n_hidden] * nb_node_layer,
-                    output_activation="TanH",
+                    output_activation="Tanh",
                     hidden_activation="SiLU",
                     layer_norm=True,
                     batch_norm=False,
                 )
-                for i in range(hparams["n_graph_iters"])
+                for i in range(n_graph_iters)
             ]
         )
         
         # edge decoder
-        self.edge_decoder = make_mlp(
+        self.edge_decoder = self.make_mlp(
             input_size=n_hidden,
             sizes=[n_hidden] * nb_edge_layer,
-            output_activation="TanH",
+            output_activation="Tanh",
             hidden_activation="SiLU",
             layer_norm=True,
             batch_norm=False,
         )
 
         # edge output transform layer
-        self.edge_output_transform = make_mlp(
+        self.edge_output_transform = self.make_mlp(
             input_size=n_hidden,
             sizes=[n_hidden, 1],
             output_activation=None,
@@ -129,6 +134,7 @@ class InteractionGNN(nn.Module):
         self.dropout = nn.Dropout(p=0.1)
         
     def make_mlp(
+        self, 
         input_size,
         sizes,
         hidden_activation="ReLU",
@@ -184,22 +190,22 @@ class InteractionGNN(nn.Module):
             layers.append(output_activation())
         return nn.Sequential(*layers)
 
-    def message_step(self, x, start, end, e):
+    def message_step(self, x, e, src, dst, i):
         # Compute new node features
-        edge_messages = torch.cat([
-            self.aggregation(e, end, dim_size=x.shape[0]),
-            self.aggregation(e, start, dim_size=x.shape[0]),
-        ], dim=-1)
+        edge_inputs = torch.cat([e, x[src], x[dst]], dim=-1)  # order dst src x ?
+        e_updated = self.edge_network[i](edge_inputs)
+        edge_messages_from_src = scatter_add(e_updated, dst, dim=0, dim_size=x.shape[0])
+        edge_messages_from_dst = scatter_add(e_updated, src, dim=0, dim_size=x.shape[0])
 
-        node_inputs = torch.cat([x, edge_messages], dim=-1)
-
-        x_out = self.node_network(node_inputs)
-
-        # Compute new edge features
-        edge_inputs = torch.cat([x_out[start], x_out[end], e], dim=-1)
-        e_out = self.edge_network(edge_inputs)
-
-        return x_out, e_out
+        node_inputs = torch.cat(
+            [edge_messages_from_src, edge_messages_from_dst, x], dim=-1
+        )  # to check : the order dst src  x ?
+        x_updated = self.node_network[i](node_inputs)
+        return (
+            x_updated,
+            e_updated,
+            self.edge_output_transform(self.edge_decoder(e_updated)),
+        )
 
     def output_step(self, x, start, end, e):
         classifier_inputs = torch.cat([x[start], x[end], e], dim=1)
@@ -211,22 +217,22 @@ class InteractionGNN(nn.Module):
         src, dst = batch.edge_index
         x.requires_grad = True
         x = self.node_encoder(x)
-        e = self.edge_encoder(torch.cat([x[start], x[end]], dim=1))
+        e = self.edge_encoder(torch.cat([x[src], x[dst]], dim=1))
         
         # if concat
         input_x = x
         input_e = e
         outputs = []
-        for _ in range(self.n_graph_iters):
+        for i in range(self.n_graph_iters):
             # if concat
             x = torch.cat([x, input_x], dim=-1)
             e = torch.cat([e, input_e], dim=-1)
-            x, e, out = self.message_step(x, e, src, dst)
+            x, e, out = self.message_step(x, e, src, dst, i)
             outputs.append(out)
 
         return outputs[-1].squeeze(-1)
 
-    def loss_function(self, output, batch):
+    def loss_function(self, output, batch, balance="proportional"):
         """
         Applies the loss function to the output of the model and the truth labels.
         To balance the positive and negative contribution, simply take the means of each separately.
@@ -237,18 +243,53 @@ class InteractionGNN(nn.Module):
         assert hasattr(batch, "y"), "The batch does not have a truth label"
         assert hasattr(batch, "weights"), "The batch does not have a weighting label"
         
-        negative_mask = ((batch.y == 0) & (batch.weights != 0)) | (batch.weights < 0) 
-        
+        assert hasattr(batch, "y"), (
+            "The batch does not have a truth label. Please ensure the batch has a `y`"
+            " attribute."
+        )
+        assert hasattr(batch, "weights"), (
+            "The batch does not have a weighting label. Please ensure the batch"
+            " weighting is handled in preprocessing."
+        )
+
+        if balance not in ["equal", "proportional"]:
+            warnings.warn(
+                f"{balance} is not a proper choice for the loss balance. Use either 'equal' or 'proportional'. Automatically switching to 'proportional' instead."
+            )
+            balance = "proportional"
+
+        negative_mask = ((batch.y == 0) & (batch.weights != 0)) | (batch.weights < 0)
+
         negative_loss = F.binary_cross_entropy_with_logits(
-            output[negative_mask], torch.zeros_like(output[negative_mask]), weight=batch.weights[negative_mask].abs()
+            output[negative_mask],
+            torch.zeros_like(output[negative_mask]),
+            weight=batch.weights[negative_mask].abs(),
+            reduction="sum",
         )
 
         positive_mask = (batch.y == 1) & (batch.weights > 0)
         positive_loss = F.binary_cross_entropy_with_logits(
-            output[positive_mask], torch.ones_like(output[positive_mask]), weight=batch.weights[positive_mask].abs()
+            output[positive_mask],
+            torch.ones_like(output[positive_mask]),
+            weight=batch.weights[positive_mask].abs(),
+            reduction="sum",
         )
 
-        return positive_loss + negative_loss
+        if balance == "proportional":
+            n = positive_mask.sum() + negative_mask.sum()
+            return (
+                (positive_loss + negative_loss) / n,
+                positive_loss.detach() / n,
+                negative_loss.detach() / n,
+            )
+        else:
+            n_pos, n_neg = positive_mask.sum(), negative_mask.sum()
+            n = n_pos + n_neg
+            return (
+                positive_loss / n_pos + negative_loss / n_neg,
+                positive_loss.detach() / n,
+                negative_loss.detach() / n,
+            )
 
     @torch.no_grad()
     def evaluate(self, graph, features, test_idx, labels):
@@ -587,23 +628,27 @@ def main(args, batches=None):
                                 truth_map=data["truth_map"],
                                 weights=data["weights"])
 
+            # data_obj = dataset.preprocess_event(data_obj)
             trainset.append(data_obj)
         trainset = Batch.from_data_list(trainset)
-        trainset = trainset.to(device)
+        # trainset = trainset.to(device)
+        print(f"trainset: {trainset}", flush=True)
+        print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
+        print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
 
         node_count = torch.max(trainset.edge_index) + 1
         edge_count = trainset.edge_index.size(1)
-        g_loc = torch.sparse_coo_tensor(trainset.edge_index,
-                                            torch.cuda.FloatTensor(edge_count).fill_(1),
-                                            torch.Size([node_count, node_count]))
-        edge_index_colsort, col_sort_idxs = trainset.edge_index[1, :].sort()
-        edge_index_colsort = trainset.edge_index[:,col_sort_idxs]
-        edge_index_rowsort, sort_idxs = edge_index_colsort[0,:].sort()
-        edge_index_sort = edge_index_colsort[:, sort_idxs]
+        # g_loc = torch.sparse_coo_tensor(trainset.edge_index,
+        #                                     torch.cuda.FloatTensor(edge_count).fill_(1),
+        #                                     torch.Size([node_count, node_count]))
+        # edge_index_colsort, col_sort_idxs = trainset.edge_index[1, :].sort()
+        # edge_index_colsort = trainset.edge_index[:,col_sort_idxs]
+        # edge_index_rowsort, sort_idxs = edge_index_colsort[0,:].sort()
+        # edge_index_sort = edge_index_colsort[:, sort_idxs]
 
-        y_colsort = trainset.y[col_sort_idxs]
-        y_sort = y_colsort[sort_idxs]
-        g_loc = g_loc.to_sparse_csr()
+        # y_colsort = trainset.y[col_sort_idxs]
+        # y_sort = y_colsort[sort_idxs]
+        # g_loc = g_loc.to_sparse_csr()
         num_features = 1
         num_classes = 2
 
@@ -623,23 +668,34 @@ def main(args, batches=None):
                       device,
                       row_groups=row_groups,
                       col_groups=col_groups)
+    print(f"model: {model}", flush=True)
 
     model = model.to(device)
 
     # use optimizer
+    print(f"lr: {args.lr}", flush=True)
     optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=args.lr,
             betas=(0.9, 0.999),
             eps=1e-08,
             amsgrad=True,
+            weight_decay=0.01
         )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=10,
+                    gamma=0.9,
+                )
 
-    train_loader = NeighborLoader(trainset,  
-                                    # num_neighbors=[5,5,5], 
-                                    num_neighbors=[5], 
-                                    batch_size=10000, 
-                                    num_workers=1) 
+    # train_loader = NeighborLoader(trainset,  
+    #                                 # num_neighbors=[5,5,5], 
+    #                                 num_neighbors=[5], 
+    #                                 batch_size=10000, 
+    #                                 num_workers=1) 
+    kwargs = {'batch_size': args.batch_size, 'num_workers': 16}
+    train_loader = ShaDowKHopSampler(trainset, depth=2, num_neighbors=4, **kwargs)
+    print(f"len(train_loader): {len(train_loader)}", flush=True)
 
     model.train()
     dur = []
@@ -649,93 +705,102 @@ def main(args, batches=None):
             epoch_start = time.time()
 
         batches_all = torch.arange(node_count).cuda()
-        # batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
-        batch_count = -(node_count // -10000) # ceil(train_nid.size(0) / batch_size)
+        batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
         print(f"node_count: {node_count}", flush=True)
         print(f"batch_count: {batch_count}", flush=True)
         # for b in range(0, batch_count, args.n_bulkmb):
-        for b in range(0, batch_count, 1):
-        # for batch in train_loader:
-            # batches_all = torch.randperm(node_count)
-            # b + bulkmb * batch_size.view(bulkmb, batch_size)
-            batches = batches_all[b:(b + 1 * 10000)].view(1, 10000).int()
-            batches_loc = batches
-            batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
-            batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
-            batches_indices_cols = batches_loc.view(-1)
-            batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
-            batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), device=device).fill_(1.0)
-            batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, (batches_loc.size(0), node_count))
+        # for b in range(0, batch_count, 1):
+        print(f"len(train_loader): {len(train_loader)}", flush=True)
+        for batch in train_loader:
+            # # batches_all = torch.randperm(node_count)
+            # # b + bulkmb * batch_size.view(bulkmb, batch_size)
+            # batches = batches_all[b:(b + 1 * 10000)].view(1, 10000).int()
+            # batches_loc = batches
+            # batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
+            # batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
+            # batches_indices_cols = batches_loc.view(-1)
+            # batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
+            # batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), device=device).fill_(1.0)
+            # batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, (batches_loc.size(0), node_count))
 
-            args.n_darts = [edge_count / node_count]
-            rep_pass = 1
-            nnz_row_masks = None
-            print(f"g_loc: {g_loc}", flush=True)
-            print(f"trainset.edge_index2: {trainset.edge_index}", flush=True)
-            frontiers_bulk, adj_matrices_bulk = sage_sampler(g_loc,
-                                                                batches_loc, 
-                                                                10000, # batch_size
-                                                                [5],     # samp_num
-                                                                1,     # bulkmb
-                                                                1,     # nlayers
-                                                                args.n_darts,
-                                                                rep_pass, 
-                                                                nnz_row_masks, 
-                                                                rank, size, row_groups, 
-                                                                col_groups, args.timing, 
-                                                                args.baseline,
-                                                                args.replicate_graph)
+            # args.n_darts = [edge_count / node_count]
+            # rep_pass = 1
+            # nnz_row_masks = None
+            # print(f"g_loc: {g_loc}", flush=True)
+            # print(f"trainset.edge_index2: {trainset.edge_index}", flush=True)
+            # frontiers_bulk, adj_matrices_bulk = sage_sampler(g_loc,
+            #                                                     batches_loc, 
+            #                                                     10000, # batch_size
+            #                                                     [5],     # samp_num
+            #                                                     1,     # bulkmb
+            #                                                     1,     # nlayers
+            #                                                     args.n_darts,
+            #                                                     rep_pass, 
+            #                                                     nnz_row_masks, 
+            #                                                     rank, size, row_groups, 
+            #                                                     col_groups, args.timing, 
+            #                                                     args.baseline,
+            #                                                     args.replicate_graph)
 
-            frontier = frontiers_bulk[1].view(-1)
-            # x_batch = trainset.x[frontier]
+            # frontier = frontiers_bulk[1].view(-1)
+            # # x_batch = trainset.x[frontier]
+            # # edge_index_batch = adj_matrices_bulk[0].to_sparse_coo()._indices()
+            # # y_batch = y_sort[frontier]
+            # # hit_id_batch = trainset.hit_id[frontier]
+            # # z_batch = trainset.z[frontier]
+            # # truth_map_batch = trainset.truth_map
+            # # weights_batch = trainset.weights[frontier]
+            # # ptr_batch = trainset.ptr
+            # # input_id_batch = frontiers_bulk[0].view(-1)
+
             # edge_index_batch = adj_matrices_bulk[0].to_sparse_coo()._indices()
+            # col_idx_to_frontier = frontier[edge_index_batch[1,:]]
+            # frontier_unique, unique_idxs = col_idx_to_frontier.unique(return_inverse=True)
+            # x_batch = trainset.x[frontier_unique]
+            # edge_index_batch_rows = edge_index_batch[0,:]
+            # edge_index_batch_cols = unique_idxs
+            # edge_index_batch = torch.stack((edge_index_batch_cols, edge_index_batch_rows))
             # y_batch = y_sort[frontier]
-            # hit_id_batch = trainset.hit_id[frontier]
-            # z_batch = trainset.z[frontier]
+            # hit_id_batch = trainset.hit_id[frontier_unique]
+            # z_batch = trainset.z[frontier_unique]
             # truth_map_batch = trainset.truth_map
             # weights_batch = trainset.weights[frontier]
             # ptr_batch = trainset.ptr
             # input_id_batch = frontiers_bulk[0].view(-1)
 
-            edge_index_batch = adj_matrices_bulk[0].to_sparse_coo()._indices()
-            col_idx_to_frontier = frontier[edge_index_batch[1,:]]
-            frontier_unique, unique_idxs = col_idx_to_frontier.unique(return_inverse=True)
-            x_batch = trainset.x[frontier_unique]
-            edge_index_batch_rows = edge_index_batch[0,:]
-            edge_index_batch_cols = unique_idxs
-            edge_index_batch = torch.stack((edge_index_batch_cols, edge_index_batch_rows))
-            y_batch = y_sort[frontier]
-            hit_id_batch = trainset.hit_id[frontier_unique]
-            z_batch = trainset.z[frontier_unique]
-            truth_map_batch = trainset.truth_map
-            weights_batch = trainset.weights[frontier]
-            ptr_batch = trainset.ptr
-            input_id_batch = frontiers_bulk[0].view(-1)
-
-            # print(f"batch: {batch}", flush=True)
-            # print(f"batch.input_id: {batch.input_id}", flush=True)
-            # print(f"batch.edge_index: {batch.edge_index}", flush=True)
-            # optimizer.zero_grad()
-            batch = Batch(x=x_batch,
-                                edge_index=edge_index_batch,
-                                y=y_batch,
-                                hit_id=hit_id_batch,
-                                z=z_batch,
-                                truth_map=truth_map_batch,
-                                weights=weights_batch,
-                                ptr=ptr_batch,
-                                input_id=input_id_batch,
-                                batch_size=10000)
+            # # print(f"batch: {batch}", flush=True)
+            # # print(f"batch.input_id: {batch.input_id}", flush=True)
+            # # print(f"batch.edge_index: {batch.edge_index}", flush=True)
+            # # optimizer.zero_grad()
+            # batch = Batch(x=x_batch,
+            #                     edge_index=edge_index_batch,
+            #                     y=y_batch,
+            #                     hit_id=hit_id_batch,
+            #                     z=z_batch,
+            #                     truth_map=truth_map_batch,
+            #                     weights=weights_batch,
+            #                     ptr=ptr_batch,
+            #                     input_id=input_id_batch,
+            #                     batch_size=10000)
             print(f"batch: {batch}", flush=True)
+            optimizer.zero_grad()
+            batch = batch.to(device)
             logits = model(batch, epoch)
-            loss = model.loss_function(logits, batch)     
-            print(f"loss: {loss}", flush=True)
+            loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
+            print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
+            wandb.log({'loss': loss.item(),
+                            'pos_loss': pos_loss.item(), 
+                            'neg_loss': neg_loss.item(), 
+                            'epoch': epoch})
             loss.backward()
             optimizer.step()
 
             # for name, W in model.named_parameters():
             #     print(f"name: {name} W.grad.sum: {W.grad.sum()}", flush=True)
 
+        scheduler.step()
+        curr_lr = scheduler.get_last_lr()
+        print(f"Epoch: {epoch} lr: {curr_lr}", flush=True)
         if epoch >= 1:
             dur.append(time.time() - epoch_start)
         if epoch >= 1 and epoch % 5 == 0:
@@ -752,7 +817,7 @@ if __name__ == '__main__':
                         help="dropout probability")
     parser.add_argument("--gpu", type=int, default=4,
                         help="gpus per node")
-    parser.add_argument("--lr", type=float, default=1e-3,
+    parser.add_argument("--lr", type=float, default=0.0002,
                         help="learning rate")
     parser.add_argument("--n-epochs", type=int, default=200,
                         help="number of training epochs")
@@ -760,7 +825,7 @@ if __name__ == '__main__':
                         help="number of hidden units")
     parser.add_argument("--n-layers", type=int, default=1,
                         help="number of hidden gcn layers")
-    parser.add_argument("--batch-size", type=int, default=512,
+    parser.add_argument("--batch-size", type=int, default=1024,
                         help="number of vertices in minibatch")
     parser.add_argument("--samp-num", type=str, default="2-2",
                         help="number of vertices per layer of minibatch")
