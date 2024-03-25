@@ -33,8 +33,8 @@ from sparse_coo_tensor_cpp import sort_dst_proc_gpu
 import socket
 import yaml
 
-import wandb
-wandb.init(project="exatrkx")
+# import wandb
+# wandb.init(project="exatrkx")
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
@@ -217,7 +217,7 @@ class InteractionGNN(nn.Module):
         src, dst = batch.edge_index
         x.requires_grad = True
         x = self.node_encoder(x)
-        e = self.edge_encoder(torch.cat([x[src], x[dst]], dim=1))
+        e = self.edge_encoder(torch.cat([x[src], x[dst]], dim=-1))
         
         # if concat
         input_x = x
@@ -634,7 +634,10 @@ def main(args, batches=None):
         # trainset = trainset.to(device)
         print(f"trainset: {trainset}", flush=True)
         print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
+        print(f"trainset.y.sum: {trainset.y.sum()}", flush=True)
         print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
+        print(f"trainset.truth_map.sum: {trainset.truth_map.sum()}", flush=True)
+        print(f"trainset.weights.sum: {trainset.weights.sum()}", flush=True)
 
         node_count = torch.max(trainset.edge_index) + 1
         edge_count = trainset.edge_index.size(1)
@@ -688,13 +691,18 @@ def main(args, batches=None):
                     gamma=0.9,
                 )
 
+    torch.manual_seed(0)
     # train_loader = NeighborLoader(trainset,  
     #                                 # num_neighbors=[5,5,5], 
-    #                                 num_neighbors=[5], 
-    #                                 batch_size=10000, 
+    #                                 num_neighbors=[5,5], 
+    #                                 batch_size=1024, 
     #                                 num_workers=1) 
-    kwargs = {'batch_size': args.batch_size, 'num_workers': 16}
-    train_loader = ShaDowKHopSampler(trainset, depth=2, num_neighbors=4, **kwargs)
+    train_loader = ShaDowKHopSampler(trainset, 
+                                        depth=2, 
+                                        num_neighbors=4, 
+                                        batch_size=args.batch_size, 
+                                        num_workers=16)
+
     print(f"len(train_loader): {len(train_loader)}", flush=True)
 
     model.train()
@@ -783,15 +791,17 @@ def main(args, batches=None):
             #                     input_id=input_id_batch,
             #                     batch_size=10000)
             print(f"batch: {batch}", flush=True)
+            print(f"batch.root: {batch.root_n_id}", flush=True)
+            print(f"batch.weights.sum: {batch.weights.sum()}", flush=True)
             optimizer.zero_grad()
             batch = batch.to(device)
             logits = model(batch, epoch)
             loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
             print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
-            wandb.log({'loss': loss.item(),
-                            'pos_loss': pos_loss.item(), 
-                            'neg_loss': neg_loss.item(), 
-                            'epoch': epoch})
+            # wandb.log({'loss': loss.item(),
+            #                 'pos_loss': pos_loss.item(), 
+            #                 'neg_loss': neg_loss.item(), 
+            #                 'epoch': epoch})
             loss.backward()
             optimizer.step()
 
