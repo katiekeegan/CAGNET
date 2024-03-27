@@ -1,4 +1,5 @@
 import math 
+import numpy as np
 import torch 
 import torch.distributed as dist 
 import torch_geometric
@@ -7,6 +8,11 @@ import torch_sparse
 from collections import defaultdict
 from pathlib import Path
 import os
+from sklearn.metrics import auc, roc_curve
+from tqdm import tqdm
+from matplotlib import pyplot as plt
+from atlasify import atlasify
+import seaborn as sns
 
 from sparse_coo_tensor_cpp import downsample_gpu, compute_darts_gpu, throw_darts_gpu, \
                                     compute_darts_select_gpu, throw_darts_select_gpu, \
@@ -2263,6 +2269,158 @@ def map_edges_to_tracks(
     raise NotImplementedError(
         "This is not a meaningful operation, but it is needed for completeness"
     )
+
+def graph_roc_curve(dataset_name, test_batches, title, filename):
+    """
+    Plot the ROC curve for the graph construction efficiency.
+    """
+    print(
+        "Plotting the ROC curve and score distribution, events from"
+        f" {dataset_name}"
+    )
+    all_y_truth, all_scores, masked_scores, masked_y_truth = [], [], [], []
+    masks = []
+    # dataset_name = config["dataset"]
+    # dataset = getattr(lightning_module, dataset_name)
+
+    # for event in tqdm(dataset):
+    for event in tqdm(test_batches):
+        # event = event.to(lightning_module.device)
+        event = event.cuda()
+        # Need to apply score cut and remap the truth_map
+        if "weights" in get_pyg_data_keys(event):
+            target_y = event.weights.bool() & event.y.bool()
+            mask = event.weights > 0
+        else:
+            target_y = event.y.bool()
+            mask = torch.ones_like(target_y).bool().to(target_y.device)
+
+        all_y_truth.append(target_y)
+        all_scores.append(event.scores)
+        masked_scores.append(event.scores[mask])
+        masked_y_truth.append(target_y[mask])
+        masks.append(mask)
+
+    all_scores = torch.cat(all_scores).cpu().numpy()
+    all_y_truth = torch.cat(all_y_truth).cpu().numpy()
+    masked_scores = torch.cat(masked_scores).cpu().numpy()
+    masked_y_truth = torch.cat(masked_y_truth).cpu().numpy()
+    masks = torch.cat(masks).cpu().numpy()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    # Get the ROC curve
+    fpr, tpr, _ = roc_curve(all_y_truth, all_scores)
+    full_auc_score = auc(fpr, tpr)
+
+    # Plot the ROC curve
+    ax.plot(fpr, tpr, color="black", label="ROC curve")
+
+    # Get the ROC curve
+    fpr, tpr, _ = roc_curve(masked_y_truth, masked_scores)
+    masked_auc_score = auc(fpr, tpr)
+
+    # Plot the ROC curve
+    ax.plot(fpr, tpr, color="green", label="masked ROC curve")
+
+    ax.plot([0, 1], [0, 1], color="black", linestyle="--", label="Random classifier")
+    ax.set_xlabel("False Positive Rate", ha="right", x=0.95, fontsize=14)
+    ax.set_ylabel("True Positive Rate", ha="right", y=0.95, fontsize=14)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.legend(loc="lower right", fontsize=14)
+    ax.text(
+        0.95,
+        0.20,
+        f"Full AUC: {full_auc_score:.3f}, Masked AUC: {masked_auc_score: .3f}",
+        ha="right",
+        va="bottom",
+        transform=ax.transAxes,
+        fontsize=14,
+    )
+
+    # Save the plot
+    atlasify(
+        "Internal",
+        # f"{plot_config['title']} \n"
+        f"{title} \n"
+        r"$\sqrt{s}=14$TeV, $t \bar{t}$, $\langle \mu \rangle = 200$, primaries $t"
+        r" \bar{t}$ and soft interactions) " + "\n"
+        r"$p_T > 1$GeV, $|\eta| < 4$"
+        + "\n"
+        # + f"Evaluated on {dataset.len()} events in {dataset_name}",
+        + f"Evaluated on {len(test_batches)} events in {dataset_name}",
+    )
+    # filename_template = plot_config.get("filename")
+    filename_template = filename
+    filename = (
+        f"{filename_template}_roc_curve.png"
+        if filename_template is not None
+        else "roc_curve.png"
+    )
+    # filename = os.path.join(config["stage_dir"], filename)
+    filename = os.path.join(".", filename)
+    fig.savefig(filename)
+    print("Finish plotting. Find the ROC curve at" f" {filename}")
+    plt.close()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    all_y_truth = all_y_truth.astype(np.int16)
+    all_y_truth[~masks] = 2
+    labels = np.array(["Fake"] * len(all_y_truth))
+    labels[all_y_truth == 1] = "Target True"
+    labels[all_y_truth == 2] = "Non-target True"
+    # weight = 1 / dataset.len()
+    weight = 1 / len(test_batches)
+    ax = plot_score_histogram(all_scores, labels, ax=ax, inverse_dataset_length=weight)
+    ax.set_xlabel("Edge score", ha="right", x=0.95, fontsize=14)
+    ax.set_ylabel("Count/event", ha="right", y=0.95, fontsize=14)
+    atlasify(
+        "Internal",
+        "Score Distribution \n"
+        r"$\sqrt{s}=14$TeV, $t \bar{t}$, $\langle \mu \rangle = 200$, primaries $t"
+        r" \bar{t}$ and soft interactions) " + "\n"
+        r"$p_T > 1$GeV, $|\eta| < 4$"
+        + "\n"
+        # + f"Evaluated on {dataset.len()} events in {dataset_name}",
+        + f"Evaluated on {len(test_batches)} events in {dataset_name}",
+    )
+    filename = (
+        f"{filename_template}_score_distribution.png"
+        if filename_template is not None
+        else "score_distribution.png"
+    )
+    # filename = os.path.join(config["stage_dir"], filename)
+    filename = os.path.join(".", filename)
+    fig.savefig(filename)
+    print("Finish plotting. Find the score distribution at" f" {filename}")
+
+def plot_score_histogram(scores, y, bins=100, ax=None, inverse_dataset_length=1):
+    """
+    Plot a histogram of scores, labelled by truth
+    """
+    # weight each entry by the inverse of dataset length, such that the y axis relects the count per event per bin
+    weights = np.array([inverse_dataset_length] * len(scores))
+    ax = sns.histplot(
+        x=scores,
+        hue=y,
+        bins=100,
+        stat="count",
+        weights=weights,
+        log_scale=(False, True),
+        ax=ax,
+        element="step",
+        palette="colorblind",
+        fill=False,
+    )
+    sns.move_legend(
+        ax,
+        "lower center",
+        bbox_to_anchor=(0.5, 1),
+        ncol=np.unique(y).shape[0],
+        title=None,
+        frameon=False,
+    )
+
+    return ax
 
 # class GraphDataset(Dataset):
 #     """

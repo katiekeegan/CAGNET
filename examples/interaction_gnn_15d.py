@@ -15,7 +15,7 @@ import torch_geometric.transforms as T
 from torch_geometric.data import Batch, Data, Dataset
 from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
-from torch_geometric.loader import NeighborSampler, NeighborLoader
+from torch_geometric.loader import DataLoader, NeighborSampler, NeighborLoader
 from torch_geometric.loader.shadow import ShaDowKHopSampler
 from torch_geometric.utils import add_remaining_self_loops
 from torch_scatter import scatter_add
@@ -212,7 +212,7 @@ class InteractionGNN(nn.Module):
         classifier_output = self.output_edge_classifier(classifier_inputs).squeeze(-1)
         return classifier_output
 
-    def forward(self, batch, epoch):
+    def forward(self, batch, epoch=0):
         x = torch.stack([batch["z"]], dim=-1).float()
         src, dst = batch.edge_index
         x.requires_grad = True
@@ -292,100 +292,47 @@ class InteractionGNN(nn.Module):
             )
 
     @torch.no_grad()
-    def evaluate(self, graph, features, test_idx, labels):
-        # subgraph_loader = NeighborSampler(graph, node_idx=None,
-        #                                   sizes=[-1], batch_size=2048,
-        #                                   shuffle=False, num_workers=6)
+    def evaluate(self, test_loader):
+        """
+        The gateway for the evaluation stage. This class method is called from the eval_stage.py script.
+        """
+        test_batches = []
+        for i, batch in enumerate(test_loader):
+            batch = batch.to(self.device)
+            output = self(batch)
+            loss, pos_loss, neg_loss = self.loss_function(output, batch)
 
-        # for i in range(self.n_layers):
-        #     xs = []
-        #     for batch_size, n_id, adj in subgraph_loader:
-        #         edge_index, _, size = adj.to(self.device)
-        #         x = features[n_id].to(self.device)
-        #         # edge_index, _, size = adj
-        #         # x = features[n_id]
-        #         # x_target = x[:size[1]]
-        #         # x = self.convs[i]((x, x_target), edge_index)
-        #         x = self.layers[i](x, edge_index)
-        #         if i != self.n_layers - 1:
-        #             x = F.relu(x)
-        #         # xs.append(x)
-        #         xs.append(x[:batch_size])
+            scores = torch.sigmoid(output)
+            batch.scores = scores.detach()
+            test_batches.append(batch)
 
-        #     features = torch.cat(xs, dim=0)
+        graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "cagnet")
 
-        # return features
+        # # Load data from testset directory
+        # graph_constructor = cls(config).to(device)
+        # if checkpoint is not None:
+        #     print(f"Restoring model from {checkpoint}")
+        #     graph_constructor = cls.load_from_checkpoint(checkpoint, hparams=config).to(
+        #         device
+        #     )
+        # graph_constructor.setup(stage="test")
 
-        subgraph_loader = NeighborSampler(graph, node_idx=None,
-                                          sizes=[-1], batch_size=2048,
-        # subgraph_loader = NeighborSampler(graph, node_idx=test_idx,
-                                          # sizes=[-1, -1], batch_size=512,
-                                          shuffle=False)
-        non_eval_timings = copy.deepcopy(self.timings)
-        for l, layer in enumerate(self.layers):
-            hs = []
-            for batch_size, n_id, adj in subgraph_loader:
-                # edge_index, _, size = adj.to(self.device)
-                edge_index, _, size = adj
-                adj_batch = torch.sparse_coo_tensor(edge_index, 
-                                                        torch.FloatTensor(edge_index.size(1)).fill_(1.0),
-                                                        size)
-                adj_batch = adj_batch.t().coalesce()
-                h = features[n_id]
+        # plots:
+        #   graph_scoring_efficiency: 
+        #     title: Interaction GNN Edge-wise Efficiency
+        #     pt_units: GeV
+        #   graph_roc_curve:
+        #     title: Interaction GNN ROC curve
+        # all_plots = config["plots"]
 
-                # h = layer(self, adj_batch, h_batch, epoch=-1) # GCNConv
-                h = self.layers[l](h, edge_index)
-                if l != len(self.layers) - 1:
-                    h = CAGF.relu(h, self.partitioning)
-                # hs.append(h) # GCNConv
-                hs.append(h[:batch_size]) # SAGEConv
-            features = torch.cat(hs, dim=0)
-        return features
-
-        # print(f"test_idx: {test_idx}", flush=True)
-        # non_eval_timings = copy.deepcopy(self.timings)
-        # correct_count = 0
-        # for batch_size, n_id, adjs in subgraph_loader:
-        #     h = features[n_id]
-        #     for l, (edge_index, _, size) in enumerate(adjs):
-        #         # h = layer(self, adj_batch, h_batch, epoch=-1) # GCNConv
-        #         h = self.layers[l](h, edge_index) # SAGEConv
-        #         if l != len(self.layers) - 1:
-        #             h = F.relu(h)
-        #     h = F.log_softmax(h, dim=1)
-        #     batch = n_id[:batch_size]
-        #     print(f"batch: {batch}", flush=True)
-        #     print(f"h[:batch_size]: {h[:batch_size]}", flush=True)
-        #     print(f"h[:batch_size].argmax(dim=-1): {h[:batch_size].argmax(dim=-1)}", flush=True)
-        #     preds = h[:batch_size].argmax(dim=-1) == labels[batch]
-        #     correct_count += preds.sum()
-        # return correct_count
-
-        # """ SAGEConv inference """
-        # subgraph_loader = NeighborSampler(graph, node_idx=None,
-        #                                   sizes=[-1], batch_size=2048,
-        #                                   shuffle=False)
-
-        # # Compute representations of nodes layer by layer, using *all*
-        # # available edges. This leads to faster computation in contrast to
-        # # immediately computing the final representations of each batch.
-        # total_edges = 0
-        # for i in range(self.n_layers):
-        #     xs = []
-        #     for batch_size, n_id, adj in subgraph_loader:
-        #         edge_index, _, size = adj.to(self.device)
-        #         total_edges += edge_index.size(1)
-        #         x = features[n_id].to(self.device)
-        #         # x_target = x[:size[1]]
-        #         # x = self.convs[i]((x, x_target), edge_index)
-        #         x = self.layers[i](x, edge_index) # SAGEConv
-        #         if i != self.n_layers - 1:
-        #             x = F.relu(x)
-        #         x = x[:batch_size]
-        #         xs.append(x)
-        #     features = torch.cat(xs, dim=0)
-
-        # return features
+        ## TODO: Handle the list of plots properly
+        #for plot_function, plot_config in all_plots.items():
+        #    if hasattr(eval_utils, plot_function):
+        #        getattr(eval_utils, plot_function)(
+        #            graph_constructor, plot_config, config
+        #        )
+        #    else:
+        #        print(f"Plot {plot_function} not implemented")
 
 def get_proc_groups(rank, size, replication):
     rank_c = rank // replication
@@ -641,6 +588,9 @@ def main(args, batches=None):
 
         node_count = torch.max(trainset.edge_index) + 1
         edge_count = trainset.edge_index.size(1)
+
+        testset = GraphDataset(input_dir, "testset", 10, "fit", hparams)
+        print(f"testset: {testset}", flush=True)
         # g_loc = torch.sparse_coo_tensor(trainset.edge_index,
         #                                     torch.cuda.FloatTensor(edge_count).fill_(1),
         #                                     torch.Size([node_count, node_count]))
@@ -701,7 +651,9 @@ def main(args, batches=None):
                                         depth=2, 
                                         num_neighbors=4, 
                                         batch_size=args.batch_size, 
-                                        num_workers=16)
+                                        num_workers=16,
+                                        shuffle=True)
+    test_loader = DataLoader(testset, batch_size=1, num_workers=1)
 
     print(f"len(train_loader): {len(train_loader)}", flush=True)
 
@@ -804,6 +756,10 @@ def main(args, batches=None):
             #                 'epoch': epoch})
             loss.backward()
             optimizer.step()
+
+        if epoch % 5 == 0:
+            print(f"Evaluating", flush=True)
+            model.evaluate(test_loader)
 
             # for name, W in model.named_parameters():
             #     print(f"name: {name} W.grad.sum: {W.grad.sum()}", flush=True)

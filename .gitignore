@@ -35,6 +35,7 @@ tests/torch-quiver/
 tests/*.out
 examples/wandb
 examples/*.batch
+examples/*.png
 *.qdrep
 *.out
 *.nsys-rep
