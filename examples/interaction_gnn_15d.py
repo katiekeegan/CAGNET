@@ -23,7 +23,7 @@ import torch_sparse
 
 from cagnet.nn.conv import GCNConv
 from cagnet.partitionings import Partitioning
-from cagnet.samplers import ladies_sampler, sage_sampler
+from cagnet.samplers import shadow_sampler
 from cagnet.samplers.utils import *
 import cagnet.nn.functional as CAGF
 import torch.nn.functional as F
@@ -642,20 +642,21 @@ def main(args, batches=None):
                 )
 
     torch.manual_seed(0)
-    # train_loader = NeighborLoader(trainset,  
-    #                                 # num_neighbors=[5,5,5], 
-    #                                 num_neighbors=[5,5], 
-    #                                 batch_size=1024, 
-    #                                 num_workers=1) 
-    train_loader = ShaDowKHopSampler(trainset, 
-                                        depth=2, 
-                                        num_neighbors=4, 
-                                        batch_size=args.batch_size, 
-                                        num_workers=16,
-                                        shuffle=True)
+    # train_loader = ShaDowKHopSampler(trainset, 
+    #                                     depth=2, 
+    #                                     num_neighbors=4, 
+    #                                     batch_size=args.batch_size, 
+    #                                     num_workers=16,
+    #                                     shuffle=True)
+    # print(f"len(train_loader): {len(train_loader)}", flush=True)
     test_loader = DataLoader(testset, batch_size=1, num_workers=1)
 
-    print(f"len(train_loader): {len(train_loader)}", flush=True)
+
+    g_loc_indices = trainset.edge_index.to(device)
+    g_loc_values = torch.cuda.FloatTensor(g_loc_indices.size(1)).fill_(1.0)
+    g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
+    g_loc = g_loc.to_sparse_csr()
+    print(f"g_loc: {g_loc}", flush=True)
 
     model.train()
     dur = []
@@ -664,87 +665,45 @@ def main(args, batches=None):
         if epoch >= 1:
             epoch_start = time.time()
 
-        batches_all = torch.arange(node_count).cuda()
+        # batches_all = torch.arange(node_count).cuda()
+        batches_all = torch.randperm(node_count).to(device)
         batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
         print(f"node_count: {node_count}", flush=True)
         print(f"batch_count: {batch_count}", flush=True)
-        # for b in range(0, batch_count, args.n_bulkmb):
-        # for b in range(0, batch_count, 1):
-        print(f"len(train_loader): {len(train_loader)}", flush=True)
-        for batch in train_loader:
-            # # batches_all = torch.randperm(node_count)
-            # # b + bulkmb * batch_size.view(bulkmb, batch_size)
-            # batches = batches_all[b:(b + 1 * 10000)].view(1, 10000).int()
-            # batches_loc = batches
-            # batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
-            # batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
-            # batches_indices_cols = batches_loc.view(-1)
-            # batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
-            # batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), device=device).fill_(1.0)
-            # batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, (batches_loc.size(0), node_count))
 
-            # args.n_darts = [edge_count / node_count]
-            # rep_pass = 1
-            # nnz_row_masks = None
-            # print(f"g_loc: {g_loc}", flush=True)
-            # print(f"trainset.edge_index2: {trainset.edge_index}", flush=True)
-            # frontiers_bulk, adj_matrices_bulk = sage_sampler(g_loc,
-            #                                                     batches_loc, 
-            #                                                     10000, # batch_size
-            #                                                     [5],     # samp_num
-            #                                                     1,     # bulkmb
-            #                                                     1,     # nlayers
-            #                                                     args.n_darts,
-            #                                                     rep_pass, 
-            #                                                     nnz_row_masks, 
-            #                                                     rank, size, row_groups, 
-            #                                                     col_groups, args.timing, 
-            #                                                     args.baseline,
-            #                                                     args.replicate_graph)
+        for b in range(0, batch_count, args.n_bulkmb):
+            batches = batches_all[b:(b + args.n_bulkmb * args.batch_size)].view(args.n_bulkmb, args.batch_size)
+            batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
 
-            # frontier = frontiers_bulk[1].view(-1)
-            # # x_batch = trainset.x[frontier]
-            # # edge_index_batch = adj_matrices_bulk[0].to_sparse_coo()._indices()
-            # # y_batch = y_sort[frontier]
-            # # hit_id_batch = trainset.hit_id[frontier]
-            # # z_batch = trainset.z[frontier]
-            # # truth_map_batch = trainset.truth_map
-            # # weights_batch = trainset.weights[frontier]
-            # # ptr_batch = trainset.ptr
-            # # input_id_batch = frontiers_bulk[0].view(-1)
+            batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
+            batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
+            batches_indices_cols = batches_loc.view(-1)
+            batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
+            batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), device=device).fill_(1.0)
+            batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, (batches_loc.size(0), node_count))
 
-            # edge_index_batch = adj_matrices_bulk[0].to_sparse_coo()._indices()
-            # col_idx_to_frontier = frontier[edge_index_batch[1,:]]
-            # frontier_unique, unique_idxs = col_idx_to_frontier.unique(return_inverse=True)
-            # x_batch = trainset.x[frontier_unique]
-            # edge_index_batch_rows = edge_index_batch[0,:]
-            # edge_index_batch_cols = unique_idxs
-            # edge_index_batch = torch.stack((edge_index_batch_cols, edge_index_batch_rows))
-            # y_batch = y_sort[frontier]
-            # hit_id_batch = trainset.hit_id[frontier_unique]
-            # z_batch = trainset.z[frontier_unique]
-            # truth_map_batch = trainset.truth_map
-            # weights_batch = trainset.weights[frontier]
-            # ptr_batch = trainset.ptr
-            # input_id_batch = frontiers_bulk[0].view(-1)
+            node_count = trainset.x.size(0)
+            if args.n_darts == -1:
+                avg_degree = int(edge_count / node_count)
+                args.n_darts = []
+                avg_degree = edge_count / node_count
+                for d in range(args.n_layers):
+                    dart_count = int(avg_degree * args.samp_num[d] / avg_degree)
+                    args.n_darts.append(dart_count)
 
-            # # print(f"batch: {batch}", flush=True)
-            # # print(f"batch.input_id: {batch.input_id}", flush=True)
-            # # print(f"batch.edge_index: {batch.edge_index}", flush=True)
-            # # optimizer.zero_grad()
-            # batch = Batch(x=x_batch,
-            #                     edge_index=edge_index_batch,
-            #                     y=y_batch,
-            #                     hit_id=hit_id_batch,
-            #                     z=z_batch,
-            #                     truth_map=truth_map_batch,
-            #                     weights=weights_batch,
-            #                     ptr=ptr_batch,
-            #                     input_id=input_id_batch,
-            #                     batch_size=10000)
-            print(f"batch: {batch}", flush=True)
-            print(f"batch.root: {batch.root_n_id}", flush=True)
-            print(f"batch.weights.sum: {batch.weights.sum()}", flush=True)
+            if args.replicate_graph:
+                rep_pass = 1
+            else:
+                rep_pass = args.replication
+
+            frontiers_bulk, adj_matrices_bulk = shadow_sampler(g_loc, batches_loc, args.batch_size, \
+                                                                    [4], args.n_bulkmb, \
+                                                                    # 2, args.n_darts, \
+                                                                    1, args.n_darts, \
+                                                                    rep_pass, rank, size, row_groups, \
+                                                                    col_groups, args.timing, \
+                                                                    args.replicate_graph)
+
             optimizer.zero_grad()
             batch = batch.to(device)
             logits = model(batch, epoch)
