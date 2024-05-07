@@ -1090,10 +1090,6 @@ def gen_prob_dist(numerator, adj_matrix, mb_count, node_count_total, replication
         mata_rows = numerator._indices()[0,:]
         mata_cols = numerator._indices()[1,:]
         adj_row_lens = adj_matrix.crow_indices()[1:] - adj_matrix.crow_indices()[:-1]
-        print(f"mata_rows.dtype: {mata_rows.dtype}", flush=True)
-        print(f"matc_chunk_row_lens.dtype: {matc_chunk_row_lens.dtype}", flush=True)
-        print(f"mata_cols.dtype: {mata_cols.dtype}", flush=True)
-        print(f"adj_row_lens.dtype: {adj_row_lens.dtype}", flush=True)
         matc_chunk_row_lens[mata_rows] = adj_row_lens[mata_cols]
         # matc_chunk_crows = torch.cuda.LongTensor(numerator.size(0) + 1).fill_(0)
         matc_chunk_crows = torch.cuda.IntTensor(numerator.size(0) + 1).fill_(0)

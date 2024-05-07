@@ -2878,6 +2878,102 @@ void reduce_sum_gpu(const at::Tensor& matc_crows, const at::Tensor& mata_crows,
     CHECK_ERROR("reduce sum error")
 }
 
+__global__ void ShadowColselect(long *sampled_frontiers, long *sampled_frontiers_rowids, 
+                                    long *sampled_frontiers_crows, long *sampled_frontiers_cols,
+                                    long *adj_crows, long *adj_cols, bool *mask, int nnz_col_count) { 
+    int     id = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (long i = id; i < nnz_col_count; i += stride) {
+        long vtx = sampled_frontiers[i];
+        long row_id = sampled_frontiers_rowids[i];
+
+        long adj_start = adj_crows[i];
+        long adj_stop = adj_crows[i + 1];
+        long sampled_start = sampled_frontiers_crows[row_id];
+        long sampled_stop = sampled_frontiers_crows[row_id + 1];
+        for (long j = adj_start; j < adj_stop; j++) {
+            for (long k = sampled_start; k < sampled_stop; k++) {
+                if (adj_cols[j] == sampled_frontiers_cols[k]) {
+                    mask[j] = true;
+                    break;
+                }
+            }
+        }
+    } 
+}
+
+
+// shadow_colselect_gpu(sampled_frontiers, sampled_frontier_rowids, sampled_frontier_csr.crow_indices(),
+//                         sampled_frontier_csr.col_indices(), row_select_adj.crow_indices(), colselect_mask, 
+//                         sampled_frontiers.size(0), row_select_adj._nnz())
+void shadow_colselect_gpu(const at::Tensor& sampled_frontiers, const at::Tensor& sampled_frontiers_rowids,
+                            const at::Tensor& sampled_frontiers_crows, const at::Tensor& sampled_frontiers_cols,
+                            const at::Tensor& adj_crows, const at::Tensor& adj_cols, 
+                            const at::Tensor& colselect_mask, int nnz_col_count, int nnz_count) {
+
+    int BLOCK_SIZE = 256;
+    int BLOCK_COUNT = std::ceil(nnz_col_count / ((float) BLOCK_SIZE));
+    BLOCK_COUNT = std::min(BLOCK_COUNT, 65535);
+
+    if (nnz_col_count == 0) {
+        return;
+    }
+
+    ShadowColselect<<<BLOCK_COUNT, BLOCK_SIZE>>>(sampled_frontiers.data<long>(), 
+                                                    sampled_frontiers_rowids.data<long>(), 
+                                                    sampled_frontiers_crows.data<long>(),
+                                                    sampled_frontiers_cols.data<long>(),
+                                                    adj_crows.data<long>(),
+                                                    adj_cols.data<long>(),
+                                                    colselect_mask.data<bool>(), 
+                                                    nnz_col_count);
+
+    fflush(stdout);
+    CHECK_ERROR("shadow colselect error")
+}
+
+
+__global__ void RowSelectCsrDupes(long *nnz_cols, long *adj_crows, long *adj_cols, long *rowselect_crows,
+                                    long *rowselect_cols, long *rowselect_vals, int nnz_col_count) { 
+    int     id = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (long i = id; i < nnz_col_count; i += stride) {
+        long vtx = nnz_cols[i];
+        long degree = adj_crows[vtx + 1] - adj_crows[vtx];
+        // might be able to use memset here
+        for (long j = 0; j < degree; j++) {
+            // mask[row_offsets[vtx] + j] = true;
+            rowselect_cols[rowselect_crows[i] + j] = adj_cols[adj_crows[vtx] + j];
+            rowselect_vals[rowselect_crows[i] + j] = adj_crows[vtx] + j;
+        }
+    } 
+}
+void rowselect_csr_dupes_gpu(const at::Tensor& sampled_frontiers, const at::Tensor& adj_crows,
+                            const at::Tensor& adj_cols, const at::Tensor& rowselect_crows, 
+                            const at::Tensor& rowselect_cols, const at::Tensor& rowselect_vals, 
+                            int nnz_col_count, int nnz_count) {
+
+    int BLOCK_SIZE = 256;
+    int BLOCK_COUNT = std::ceil(nnz_col_count / ((float) BLOCK_SIZE));
+    BLOCK_COUNT = std::min(BLOCK_COUNT, 65535);
+
+    if (nnz_col_count == 0 || nnz_count == 0) {
+        return;
+    }
+
+    RowSelectCsrDupes<<<BLOCK_COUNT, BLOCK_SIZE>>>(sampled_frontiers.data<long>(), 
+                                                    adj_crows.data<long>(), 
+                                                    adj_cols.data<long>(),
+                                                    rowselect_crows.data<long>(),
+                                                    rowselect_cols.data<long>(),
+                                                    rowselect_vals.data<long>(),
+                                                    nnz_col_count);
+
+    CHECK_ERROR("rowselect_csr_dupes")
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sparse_coo_tensor_gpu", &sparse_coo_tensor_gpu, "Sparse COO Tensor GPU-only constructor");
     m.def("sparse_csr_tensor_gpu", &sparse_csr_tensor_gpu, "Sparse CSR Tensor GPU-only constructor");
@@ -2907,4 +3003,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rearrange_rows_gpu", &rearrange_rows_gpu, "Rearrange rows in in place of local spgemm");
     m.def("rearrangel_rows_gpu", &rearrangel_rows_gpu, "Rearrange rows in in place of local spgemm 64-bit");
     m.def("reduce_sum_gpu", &reduce_sum_gpu, "Sum for SAGE sa-spgemm reduction");
+    m.def("shadow_colselect_gpu", &shadow_colselect_gpu, "ShaDow column selection");
+    m.def("rowselect_csr_dupes_gpu", &rowselect_csr_dupes_gpu, "CSR row selection with duplicates");
 }

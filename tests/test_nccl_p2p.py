@@ -19,7 +19,7 @@ def test_nccl(args):
     if "SLURM_NTASKS" in os.environ.keys():
         os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-    os.environ["MASTER_ADDR"] = args.hostname 
+    os.environ["MASTER_ADDR"] = args.hostname # hostname of rank 0's node
     os.environ["MASTER_PORT"] = "1234"
 
     print(f"hostname: {socket.gethostname()}", flush=True)
@@ -27,6 +27,8 @@ def test_nccl(args):
     rank = dist.get_rank()
     size = dist.get_world_size()
     torch.cuda.set_device(rank % args.gpu)
+    print(f"os.cpu_count: {os.cpu_count()}", flush=True)
+    print(f"cpus_per_task: {os.environ['SLURM_CPUS_PER_TASK']}", flush=True)
 
     start_timer = torch.cuda.Event(enable_timing=True)
     stop_timer = torch.cuda.Event(enable_timing=True)

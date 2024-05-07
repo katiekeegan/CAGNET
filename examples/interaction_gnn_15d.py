@@ -17,6 +17,7 @@ from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.loader import DataLoader, NeighborSampler, NeighborLoader
 from torch_geometric.loader.shadow import ShaDowKHopSampler
+from torch_geometric.transforms import LargestConnectedComponents
 from torch_geometric.utils import add_remaining_self_loops
 from torch_scatter import scatter_add
 import torch_sparse
@@ -657,6 +658,11 @@ def main(args, batches=None):
     g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
     g_loc = g_loc.to_sparse_csr()
     print(f"g_loc: {g_loc}", flush=True)
+    print(f"g_loc[444614]: {g_loc.col_indices()[g_loc.crow_indices()[444614]:g_loc.crow_indices()[444614 + 1]]}", flush=True)
+    print(f"g_loc[446184]: {g_loc.col_indices()[g_loc.crow_indices()[446184]:g_loc.crow_indices()[446184 + 1]]}", flush=True)
+
+    components_small = LargestConnectedComponents(args.batch_size - 1)
+    components_large = LargestConnectedComponents(args.batch_size)
 
     dur = []
     for epoch in range(args.n_epochs):
@@ -720,6 +726,24 @@ def main(args, batches=None):
                             weights=trainset.weights[edge_ids_cpu])
             print(f"batch: {batch}", flush=True)
             print(f"batch.edge_index: {batch.edge_index}", flush=True)
+            batch = batch.cpu()
+            print(f"components_small: {components_small(batch)}", flush=True)
+            print(f"components_large: {components_large(batch)}", flush=True)
+            small_batch = components_small(batch).batch
+            large_batch = components_large(batch).batch
+            print(f"components_small.batch: {small_batch}", flush=True)
+            print(f"components_large.batch: {large_batch}", flush=True)
+            missing_vtx = [i for i in large_batch if i not in small_batch]
+            print(f"missing_vtx: {missing_vtx}", flush=True)
+            unique_rows = batch.edge_index[0,:].unique()
+            unique_cols = batch.edge_index[1,:].unique()
+            print(f"unique_rows: {unique_rows}", flush=True)
+            print(f"unique_cols: {unique_cols}", flush=True)
+            print(f"unique_rows.size: {unique_rows.size()}", flush=True)
+            print(f"unique_cols.size: {unique_cols.size()}", flush=True)
+            unique_rows = unique_rows.cpu().numpy()
+            unique_cols = unique_cols.cpu().numpy()
+            print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
             optimizer.zero_grad()
             batch = batch.to(device)
             logits = model(batch, epoch)
