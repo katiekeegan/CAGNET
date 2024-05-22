@@ -16,7 +16,8 @@ from torch_geometric.data import Batch, Data, Dataset
 from torch_geometric.nn import SAGEConv
 from torch_geometric.datasets import Planetoid, Reddit
 from torch_geometric.loader import DataLoader, NeighborSampler, NeighborLoader
-from torch_geometric.loader.shadow import ShaDowKHopSampler
+# from torch_geometric.loader.shadow import ShaDowKHopSampler
+from shadow import ShaDowKHopSampler
 from torch_geometric.transforms import LargestConnectedComponents
 from torch_geometric.utils import add_remaining_self_loops
 from torch_scatter import scatter_add
@@ -57,7 +58,7 @@ class InteractionGNN(nn.Module):
         self.replication = replication
         self.timings = dict()
 
-        torch.manual_seed(0)
+        # torch.manual_seed(0)
         # aggr_list = ["sum", "mean", "max", "std"]
         # self.aggregation = torch_geometric.nn.aggr.MultiAggregation(aggr_list, mode="cat")
 
@@ -300,14 +301,16 @@ class InteractionGNN(nn.Module):
         test_batches = []
         for i, batch in enumerate(test_loader):
             batch = batch.to(self.device)
+            print(f"test_batch: {batch}", flush=True)
             output = self(batch)
             loss, pos_loss, neg_loss = self.loss_function(output, batch)
+            print(f"test loss: {loss} pos_los: {pos_loss} neg_loss: {neg_loss}", flush=True)
 
             scores = torch.sigmoid(output)
             batch.scores = scores.detach()
             test_batches.append(batch)
 
-        graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "cagnet")
+        graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "torch")
 
         # # Load data from testset directory
         # graph_constructor = cls(config).to(device)
@@ -642,24 +645,24 @@ def main(args, batches=None):
                     gamma=0.9,
                 )
 
-    torch.manual_seed(0)
+    # torch.manual_seed(0)
     train_loader = ShaDowKHopSampler(trainset, 
                                         depth=1, 
                                         num_neighbors=1, 
                                         batch_size=args.batch_size, 
                                         num_workers=16,
-                                        shuffle=False)
+                                        shuffle=False,
+                                        drop_last=True)
     print(f"len(train_loader): {len(train_loader)}", flush=True)
     test_loader = DataLoader(testset, batch_size=1, num_workers=1)
 
 
     g_loc_indices = trainset.edge_index.to(device)
-    g_loc_values = torch.cuda.FloatTensor(g_loc_indices.size(1)).fill_(1.0)
+    # g_loc_values = torch.cuda.FloatTensor(g_loc_indices.size(1)).fill_(1.0)
+    g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
     g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
     g_loc = g_loc.to_sparse_csr()
     print(f"g_loc: {g_loc}", flush=True)
-    print(f"g_loc[444614]: {g_loc.col_indices()[g_loc.crow_indices()[444614]:g_loc.crow_indices()[444614 + 1]]}", flush=True)
-    print(f"g_loc[446184]: {g_loc.col_indices()[g_loc.crow_indices()[446184]:g_loc.crow_indices()[446184 + 1]]}", flush=True)
 
     components_small = LargestConnectedComponents(args.batch_size - 1)
     components_large = LargestConnectedComponents(args.batch_size)
@@ -671,17 +674,23 @@ def main(args, batches=None):
         if epoch >= 1:
             epoch_start = time.time()
 
-        # batches_all = torch.arange(node_count).to(device)
-        batches_all = torch.randperm(node_count).to(device)
+        batches_all = torch.arange(node_count).to(device)
+        # batches_all = torch.randperm(node_count).to(device)
         batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
         print(f"node_count: {node_count}", flush=True)
         print(f"batch_count: {batch_count}", flush=True)
 
-        # for batch in train_loader:
+        # for batch, n_id in train_loader:
         for b in range(0, batch_count, args.n_bulkmb):
-            batches = batches_all[b:(b + args.n_bulkmb * args.batch_size)].view(args.n_bulkmb, args.batch_size)
+            if b + args.n_bulkmb >= batch_count:
+                break
+            batches_start = b * args.batch_size
+            batches_stop = (b + args.n_bulkmb) * args.batch_size
+            batches = batches_all[batches_start:batches_stop].view(args.n_bulkmb, args.batch_size)
             batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
 
+            print(f"batches: {batches}", flush=True)
+            print(f"batches_loc: {batches_loc}", flush=True)
             batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
             batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
             batches_indices_cols = batches_loc.view(-1)
@@ -715,38 +724,49 @@ def main(args, batches=None):
 
             frontiers_bulk_cpu = frontiers_bulk.cpu()
             edge_ids_cpu = adj_matrices_bulk._values().cpu()
+            print(f"edge_ids_cpu: {edge_ids_cpu}", flush=True)
+            g_loc_coo = g_loc.to_sparse_coo()
+            print(f"edges[edge_ids]: {g_loc_coo._indices()[:,adj_matrices_bulk._values()]}", flush=True)
+            print(f"frontiers_bulk: {frontiers_bulk}", flush=True)
+            print(f"edge_index: {adj_matrices_bulk._indices()}", flush=True)
             batch = Batch(batch=frontiers_bulk, 
-                            root_n_id=batches_loc._indices()[1,:], 
                             edge_index=adj_matrices_bulk._indices(),
-                            x=trainset.x[frontiers_bulk_cpu],
                             y=trainset.y[edge_ids_cpu],
-                            hit_id=trainset.hit_id[frontiers_bulk_cpu],
                             z=trainset.z[frontiers_bulk_cpu],
-                            truth_map=trainset.truth_map,
                             weights=trainset.weights[edge_ids_cpu])
             print(f"batch: {batch}", flush=True)
+            # print(f"n_id: {n_id}", flush=True)
+            print(f"batch.batch: {batch.batch}", flush=True)
             print(f"batch.edge_index: {batch.edge_index}", flush=True)
+            print(f"batch.y: {batch.y}", flush=True)
+            print(f"batch.z: {batch.z}", flush=True)
+            print(f"batch.y.nonzero: {batch.y.nonzero().squeeze()}", flush=True)
+            print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
+            print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
             batch = batch.cpu()
-            print(f"components_small: {components_small(batch)}", flush=True)
-            print(f"components_large: {components_large(batch)}", flush=True)
-            small_batch = components_small(batch).batch
-            large_batch = components_large(batch).batch
-            print(f"components_small.batch: {small_batch}", flush=True)
-            print(f"components_large.batch: {large_batch}", flush=True)
-            missing_vtx = [i for i in large_batch if i not in small_batch]
-            print(f"missing_vtx: {missing_vtx}", flush=True)
-            unique_rows = batch.edge_index[0,:].unique()
-            unique_cols = batch.edge_index[1,:].unique()
-            print(f"unique_rows: {unique_rows}", flush=True)
-            print(f"unique_cols: {unique_cols}", flush=True)
-            print(f"unique_rows.size: {unique_rows.size()}", flush=True)
-            print(f"unique_cols.size: {unique_cols.size()}", flush=True)
-            unique_rows = unique_rows.cpu().numpy()
-            unique_cols = unique_cols.cpu().numpy()
-            print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
+
+            # print(f"components_small: {components_small(batch)}", flush=True)
+            # print(f"components_large: {components_large(batch)}", flush=True)
+            # small_batch = components_small(batch).batch
+            # large_batch = components_large(batch).batch
+            # print(f"components_small.batch: {small_batch}", flush=True)
+            # print(f"components_large.batch: {large_batch}", flush=True)
+            # missing_vtx = [i for i in large_batch if i not in small_batch]
+            # print(f"missing_vtx: {missing_vtx}", flush=True)
+            # unique_rows = batch.edge_index[0,:].unique()
+            # unique_cols = batch.edge_index[1,:].unique()
+            # print(f"unique_rows: {unique_rows}", flush=True)
+            # print(f"unique_cols: {unique_cols}", flush=True)
+            # print(f"unique_rows.size: {unique_rows.size()}", flush=True)
+            # print(f"unique_cols.size: {unique_cols.size()}", flush=True)
+            # unique_rows = unique_rows.cpu().numpy()
+            # unique_cols = unique_cols.cpu().numpy()
+            # print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
+
             optimizer.zero_grad()
             batch = batch.to(device)
             logits = model(batch, epoch)
+            print(f"logits.sum: {logits.sum()}", flush=True)
             loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
             print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
             # wandb.log({'loss': loss.item(),
