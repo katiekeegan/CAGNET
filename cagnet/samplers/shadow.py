@@ -80,7 +80,8 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
                                 replication, rank, size, row_groups, col_groups,
                                 None, timing_dict, "sage", timing_arg, replicate_graph)
 
-        frontier_size = frontier_sizes[i]
+        # frontier_size = frontier_sizes[i]
+        frontier_size = frontier_sizes[0]
         n_darts = n_darts_list[i]
         next_frontier = sample(p, frontier_size, mb_count, node_count_total, n_darts,
                                     replication, rank, size, row_groups, col_groups,
@@ -147,21 +148,11 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
 
     colselect_mask = colselect_idxs > -1
     sampled_adjs_cols = row_select_adj.col_indices()[colselect_mask]
-    print(f"sampled_frontiers: {sampled_frontiers}", flush=True)
-    print(f"sampled_frontiers.size: {sampled_frontiers.size()}", flush=True)
-    print(f"before sampled_adjs_cols: {sampled_adjs_cols}", flush=True)
-    print(f"before sampled_adjs_cols.size: {sampled_adjs_cols.size()}", flush=True)
-    # unmapped_cols = sampled_adjs_cols.clone()
-    # sampled_adjs_cols = torch.sort(sampled_adjs_cols)[1]
-    # sampled_adjs_cols = torch.sort(sampled_adjs_cols)[1]
-    # mapped_cols = sampled_adjs_cols.clone()
     sampled_adjs_cols = colselect_idxs[colselect_mask]
-    print(f"after sampled_adjs_cols: {sampled_adjs_cols}", flush=True)
     sampled_adjs_vals = row_select_adj.values()[colselect_mask]
 
     sampled_adjs_rows = row_select_adj.to_sparse_coo()._indices()[0,:]
     sampled_adjs_rows = sampled_adjs_rows[colselect_mask]
-    print(f"sampled_adjs_rows: {sampled_adjs_rows}", flush=True)
 
     sampled_adj_indices = torch.stack((sampled_adjs_rows, sampled_adjs_cols))
     sampled_frontier_size = sampled_frontiers.size(0)

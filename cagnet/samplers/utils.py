@@ -2389,6 +2389,8 @@ def graph_roc_curve(dataset_name, test_batches, title, filename):
     fig.savefig(filename)
     print("Finish plotting. Find the score distribution at" f" {filename}")
 
+    return full_auc_score, masked_auc_score
+
 def plot_score_histogram(scores, y, bins=100, ax=None, inverse_dataset_length=1):
     """
     Plot a histogram of scores, labelled by truth

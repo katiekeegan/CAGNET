@@ -35,8 +35,8 @@ from sparse_coo_tensor_cpp import sort_dst_proc_gpu
 import socket
 import yaml
 
-# import wandb
-# wandb.init(project="exatrkx")
+import wandb
+wandb.init(project="exatrkx")
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
@@ -310,7 +310,10 @@ class InteractionGNN(nn.Module):
             batch.scores = scores.detach()
             test_batches.append(batch)
 
-        graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "torch")
+        full_auc, masked_auc = graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "cagnet")
+        print(f"full_auc: {full_auc} type(full_auc): {type(full_auc)}", flush=True)
+        print(f"masked_auc: {masked_auc} type(masked_auc): {type(masked_auc)}", flush=True)
+        return full_auc, masked_auc
 
         # # Load data from testset directory
         # graph_constructor = cls(config).to(device)
@@ -647,8 +650,8 @@ def main(args, batches=None):
 
     # torch.manual_seed(0)
     train_loader = ShaDowKHopSampler(trainset, 
-                                        depth=1, 
-                                        num_neighbors=1, 
+                                        depth=args.n_layers, 
+                                        num_neighbors=args.num_neighbors, 
                                         batch_size=args.batch_size, 
                                         num_workers=16,
                                         shuffle=False,
@@ -704,7 +707,7 @@ def main(args, batches=None):
                 args.n_darts = []
                 avg_degree = edge_count / node_count
                 for d in range(args.n_layers):
-                    dart_count = int(avg_degree * args.samp_num[d] / avg_degree)
+                    dart_count = int(avg_degree * args.samp_num / avg_degree)
                     args.n_darts.append(dart_count)
 
             if args.replicate_graph:
@@ -713,9 +716,9 @@ def main(args, batches=None):
                 rep_pass = args.replication
 
             frontiers_bulk, adj_matrices_bulk = shadow_sampler(g_loc, batches_loc, args.batch_size, \
-                                                                    [1], args.n_bulkmb, \
+                                                                    [args.num_neighbors], args.n_bulkmb, \
                                                                     # 2, args.n_darts, \
-                                                                    1, args.n_darts, \
+                                                                    args.n_layers, args.n_darts, \
                                                                     rep_pass, rank, size, row_groups, \
                                                                     col_groups, args.timing, \
                                                                     args.replicate_graph)
@@ -742,8 +745,9 @@ def main(args, batches=None):
             print(f"batch.z: {batch.z}", flush=True)
             print(f"batch.y.nonzero: {batch.y.nonzero().squeeze()}", flush=True)
             print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
-            print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
-            batch = batch.cpu()
+
+            # print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
+            # batch = batch.cpu()
 
             # print(f"components_small: {components_small(batch)}", flush=True)
             # print(f"components_large: {components_large(batch)}", flush=True)
@@ -769,16 +773,16 @@ def main(args, batches=None):
             print(f"logits.sum: {logits.sum()}", flush=True)
             loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
             print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
-            # wandb.log({'loss': loss.item(),
-            #                 'pos_loss': pos_loss.item(), 
-            #                 'neg_loss': neg_loss.item(), 
-            #                 'epoch': epoch})
+            wandb.log({'loss': loss.item(),
+                            'pos_loss': pos_loss.item(), 
+                            'neg_loss': neg_loss.item(), 
+                            'epoch': epoch})
             loss.backward()
             optimizer.step()
 
         if epoch % 5 == 0:
             print(f"Evaluating", flush=True)
-            model.evaluate(test_loader)
+            full_auc, masked_auc = model.evaluate(test_loader)
 
             # for name, W in model.named_parameters():
             #     print(f"name: {name} W.grad.sum: {W.grad.sum()}", flush=True)
@@ -790,6 +794,11 @@ def main(args, batches=None):
             dur.append(time.time() - epoch_start)
         if epoch >= 1 and epoch % 5 == 0:
             print(f"Epoch time: {np.sum(dur) / epoch}", flush=True)
+            wandb.log({'full_auc': full_auc.item(),
+                            'masked_auc': masked_auc.item(), 
+                            'time': np.sum(dur).item()})
+            if epoch == 30:
+                break
     total_stop = time.time()
 
 if __name__ == '__main__':
@@ -812,8 +821,8 @@ if __name__ == '__main__':
                         help="number of hidden gcn layers")
     parser.add_argument("--batch-size", type=int, default=1024,
                         help="number of vertices in minibatch")
-    parser.add_argument("--samp-num", type=str, default="2-2",
-                        help="number of vertices per layer of minibatch")
+    parser.add_argument("--num-neighbors", type=int, default=1,
+                        help="number of neigbors per vertex of minibatch")
     parser.add_argument("--weight-decay", type=float, default=5e-4,
                         help="Weight for L2 loss")
     parser.add_argument("--aggr", type=str, default="mean",
@@ -855,7 +864,7 @@ if __name__ == '__main__':
     parser.add_argument("--n-graph-iters", type=int, default=8,
                         help="number of message passing iterations")
     args = parser.parse_args()
-    args.samp_num = [int(i) for i in args.samp_num.split('-')]
+    args.samp_num = args.num_neighbors
     print(args)
 
     main(args)
