@@ -69,9 +69,17 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
 
     # frontiers = torch.cuda.LongTensor(mb_count, node_count_total).fill_(0) # TODO: make sparse 
     # frontiers[0, batches._indices()[1,:]] = 1
-    frontiers = torch.cuda.LongTensor(mb_count * batch_size, node_count_total).fill_(0) # TODO: make sparse 
-    frontiers_idxs = batches._indices()[1,:].unsqueeze(1)
-    frontiers.scatter_(1, frontiers_idxs, 1) 
+
+    # frontiers = torch.cuda.LongTensor(mb_count * batch_size, node_count_total).fill_(0) # TODO: make sparse 
+    # frontiers_idxs = batches._indices()[1,:].unsqueeze(1)
+    # frontiers.scatter_(1, frontiers_idxs, 1) 
+    frontiers_rows = torch.arange(mb_count * batch_size, dtype=torch.int64).to(gpu)
+    frontiers_cols = batches._indices()[1,:]
+    frontiers_idxs = torch.stack((frontiers_rows, frontiers_cols))
+    frontiers_vals = torch.cuda.LongTensor(mb_count * batch_size).fill_(1)
+    frontiers = torch.sparse_coo_tensor(frontiers_idxs, frontiers_vals, 
+                                            size=torch.Size([mb_count * batch_size, node_count_total]))
+    print(f"before frontiers: {frontiers}", flush=True)
     for i in range(n_layers):
         print(f"layer {i}", flush=True)
         neighbors = batch_size * int(np.prod(frontier_sizes[:(i + 1)], dtype=int))
@@ -101,9 +109,10 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
         collapsed_frontier = torch.sparse_coo_tensor(collapsed_frontier_idxs, 
                                                         collapsed_frontier_vals,
                                                         torch.Size([mb_count * batch_size, node_count_total]))
-        collapsed_frontier_dense = collapsed_frontier.to_dense()
-    
-        frontiers = frontiers + collapsed_frontier_dense
+        # collapsed_frontier_dense = collapsed_frontier.to_dense()
+        # frontiers = frontiers + collapsed_frontier_dense
+        frontiers = frontiers + collapsed_frontier
+        frontiers = frontiers.coalesce()
 
         if i < n_layers - 1:
             expand_frontier_rows = torch.arange(collapsed_frontier._nnz()).to(gpu)
@@ -116,7 +125,10 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
             current_frontier = expand_frontier
 
     # frontiers = frontiers.view(-1).squeeze()
-    sampled_frontiers = frontiers.nonzero()[:,1]
+    # sampled_frontiers = frontiers.nonzero()[:,1]
+    sampled_frontiers = frontiers._indices()[1,:]
+    print(f"after frontiers: {frontiers}", flush=True)
+    print(f"sampled_frontiers: {sampled_frontiers}", flush=True)
 
     # rowselect_mask = torch.cuda.BoolTensor(adj_matrix._nnz()).fill_(False)
     # rowselect_csr_gpu(sampled_frontiers, adj_matrix.crow_indices(), rowselect_mask, 
@@ -147,7 +159,8 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
     row_select_adj = torch.sparse_csr_tensor(rowselect_adj_crows, rowselect_adj_cols, rowselect_adj_vals,
                                                 torch.Size([sampled_frontier_size, node_count_total]))
 
-    sampled_frontiers_rowids = frontiers.nonzero()[:,0]
+    # sampled_frontiers_rowids = frontiers.nonzero()[:,0]
+    sampled_frontiers_rowids = frontiers._indices()[0,:]
     sampled_frontiers_csr = frontiers.to_sparse_csr()
 
     # colselect_mask = torch.cuda.BoolTensor(row_select_adj._nnz()).fill_(False)
