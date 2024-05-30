@@ -35,8 +35,8 @@ from sparse_coo_tensor_cpp import sort_dst_proc_gpu
 import socket
 import yaml
 
-import wandb
-wandb.init(project="exatrkx")
+# import wandb
+# wandb.init(project="exatrkx")
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
@@ -727,10 +727,7 @@ def main(args, batches=None):
 
             frontiers_bulk_cpu = frontiers_bulk.cpu()
             edge_ids_cpu = adj_matrices_bulk._values().cpu()
-            print(f"edge_ids_cpu: {edge_ids_cpu}", flush=True)
             g_loc_coo = g_loc.to_sparse_coo()
-            print(f"edges[edge_ids]: {g_loc_coo._indices()[:,adj_matrices_bulk._values()]}", flush=True)
-            print(f"frontiers_bulk: {frontiers_bulk}", flush=True)
             print(f"edge_index: {adj_matrices_bulk._indices()}", flush=True)
             batch = Batch(batch=frontiers_bulk, 
                             edge_index=adj_matrices_bulk._indices(),
@@ -743,18 +740,17 @@ def main(args, batches=None):
             print(f"batch.edge_index: {batch.edge_index}", flush=True)
             print(f"batch.y: {batch.y}", flush=True)
             print(f"batch.z: {batch.z}", flush=True)
-            print(f"batch.y.nonzero: {batch.y.nonzero().squeeze()}", flush=True)
             print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
 
             # print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
-            # batch = batch.cpu()
+            batch = batch.cpu()
 
-            # print(f"components_small: {components_small(batch)}", flush=True)
-            # print(f"components_large: {components_large(batch)}", flush=True)
-            # small_batch = components_small(batch).batch
-            # large_batch = components_large(batch).batch
-            # print(f"components_small.batch: {small_batch}", flush=True)
-            # print(f"components_large.batch: {large_batch}", flush=True)
+            print(f"components_small: {components_small(batch)}", flush=True)
+            print(f"components_large: {components_large(batch)}", flush=True)
+            small_batch = components_small(batch).batch
+            large_batch = components_large(batch).batch
+            print(f"components_small.batch: {small_batch}", flush=True)
+            print(f"components_large.batch: {large_batch}", flush=True)
             # missing_vtx = [i for i in large_batch if i not in small_batch]
             # print(f"missing_vtx: {missing_vtx}", flush=True)
             # unique_rows = batch.edge_index[0,:].unique()
@@ -773,10 +769,10 @@ def main(args, batches=None):
             print(f"logits.sum: {logits.sum()}", flush=True)
             loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
             print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
-            wandb.log({'loss': loss.item(),
-                            'pos_loss': pos_loss.item(), 
-                            'neg_loss': neg_loss.item(), 
-                            'epoch': epoch})
+            # wandb.log({'loss': loss.item(),
+            #                 'pos_loss': pos_loss.item(), 
+            #                 'neg_loss': neg_loss.item(), 
+            #                 'epoch': epoch})
             loss.backward()
             optimizer.step()
 
@@ -794,10 +790,10 @@ def main(args, batches=None):
             dur.append(time.time() - epoch_start)
         if epoch >= 1 and epoch % 5 == 0:
             print(f"Epoch time: {np.sum(dur) / epoch}", flush=True)
-            wandb.log({'full_auc': full_auc.item(),
-                            'masked_auc': masked_auc.item(), 
-                            'time': np.sum(dur).item()})
-            if epoch == 30:
+            # wandb.log({'full_auc': full_auc.item(),
+            #                 'masked_auc': masked_auc.item(), 
+            #                 'time': np.sum(dur).item()})
+            if epoch == 5:
                 break
     total_stop = time.time()
 
@@ -805,7 +801,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='IGNN')
     parser.add_argument("--dataset", type=str, default="Cora",
                         help="dataset to train")
-    parser.add_argument("--sample-method", type=str, default="ladies",
+    parser.add_argument("--sample-method", type=str, default="shadow",
                         help="sampling algorithm for training")
     parser.add_argument("--dropout", type=float, default=0.5,
                         help="dropout probability")
