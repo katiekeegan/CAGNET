@@ -56,19 +56,14 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
     gpu = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     adj_matrix = adj_matrix.t().to_sparse_csr()
-    print(f"adj_matrix_t: {adj_matrix}", flush=True)
 
     batches_expand_rows = torch.arange(mb_count * batch_size, dtype=torch.int32, device=gpu)
     batches_expand_idxs = torch.stack((batches_expand_rows, batches._indices()[1, :]))
     batches_expand = sparse_coo_tensor_gpu(batches_expand_idxs, batches._values(), 
                                             torch.Size([mb_count * batch_size, node_count_total]))
 
-    print(f"batches_expand: {batches_expand}", flush=True)
 
     current_frontier = batches_expand
-
-    # frontiers = torch.cuda.LongTensor(mb_count, node_count_total).fill_(0) # TODO: make sparse 
-    # frontiers[0, batches._indices()[1,:]] = 1
 
     # frontiers = torch.cuda.LongTensor(mb_count * batch_size, node_count_total).fill_(0) # TODO: make sparse 
     # frontiers_idxs = batches._indices()[1,:].unsqueeze(1)
@@ -79,7 +74,6 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
     frontiers_vals = torch.cuda.LongTensor(mb_count * batch_size).fill_(1)
     frontiers = torch.sparse_coo_tensor(frontiers_idxs, frontiers_vals, 
                                             size=torch.Size([mb_count * batch_size, node_count_total]))
-    print(f"before frontiers: {frontiers}", flush=True)
     for i in range(n_layers):
         print(f"layer {i}", flush=True)
         neighbors = batch_size * int(np.prod(frontier_sizes[:(i + 1)], dtype=int))
@@ -124,25 +118,13 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
                                                             torch.Size([mb_count * neighbors, node_count_total]))
             current_frontier = expand_frontier
 
-    # frontiers = frontiers.view(-1).squeeze()
     # sampled_frontiers = frontiers.nonzero()[:,1]
     sampled_frontiers = frontiers._indices()[1,:]
-    print(f"after frontiers: {frontiers}", flush=True)
-    print(f"sampled_frontiers: {sampled_frontiers}", flush=True)
 
-    # rowselect_mask = torch.cuda.BoolTensor(adj_matrix._nnz()).fill_(False)
-    # rowselect_csr_gpu(sampled_frontiers, adj_matrix.crow_indices(), rowselect_mask, 
-    #                     sampled_frontiers.size(0), adj_matrix._nnz())
-
-    # row_lengths = adj_matrix.crow_indices()[1:] - adj_matrix.crow_indices()[:-1]
-    # rowselect_adj_crows = torch.cuda.IntTensor(sampled_frontiers.size(0) + 1).fill_(0)
-    # rowselect_adj_crows[1:] = torch.cumsum(row_lengths[sampled_frontiers], dtype=torch.int32, dim=0)
-    # rowselect_adj_crows[0] = 0
-
-    # edge_ids = rowselect_mask.nonzero().squeeze()
-    # rowselect_adj_cols = adj_matrix.col_indices()[rowselect_mask]
-    # # rowselect_adj_vals = adj_matrix.values()[rowselect_mask]
-    # rowselect_adj_vals = edge_ids
+    batch_ids = torch.div(frontiers._indices()[0,:], batch_size, rounding_mode="floor").int()
+    batch_sizes = torch.histc(batch_ids, bins=mb_count, min=0, max=mb_count-1)
+    ps_batch_sizes = torch.cumsum(batch_sizes, 0).roll(1)
+    ps_batch_sizes[0] = 0
 
     row_lengths = adj_matrix.crow_indices()[1:] - adj_matrix.crow_indices()[:-1]
     rowselect_adj_crows = torch.cuda.LongTensor(sampled_frontiers.size(0) + 1).fill_(0)
@@ -163,12 +145,11 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
     sampled_frontiers_rowids = frontiers._indices()[0,:]
     sampled_frontiers_csr = frontiers.to_sparse_csr()
 
-    # colselect_mask = torch.cuda.BoolTensor(row_select_adj._nnz()).fill_(False)
     colselect_idxs = torch.cuda.LongTensor(row_select_adj._nnz()).fill_(-1)
     shadow_colselect_gpu(sampled_frontiers, sampled_frontiers_rowids, sampled_frontiers_csr.crow_indices(),
                             sampled_frontiers_csr.col_indices(), row_select_adj.crow_indices().long(), 
-                            row_select_adj.col_indices(), colselect_idxs, sampled_frontiers.size(0), 
-                            row_select_adj._nnz())
+                            row_select_adj.col_indices(), colselect_idxs, ps_batch_sizes, batch_size, 
+                            sampled_frontiers.size(0), row_select_adj._nnz())
 
     colselect_mask = colselect_idxs > -1
     sampled_adjs_cols = row_select_adj.col_indices()[colselect_mask]
@@ -184,6 +165,25 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
                                                 torch.Size([sampled_frontier_size, sampled_frontier_size]))
 
     sampled_adjs = sampled_adjs.t()
+
+    sampled_frontiers_split = torch.split(sampled_frontiers, batch_sizes.tolist())
+
+    # sampled_adjs_indices_split = torch.split(sampled_adjs._indices(), batch_sizes.tolist(), dim=1)
+    # sampled_adjs_vals_split = torch.split(sampled_adjs._values(), batch_sizes.tolist())
+    sampled_adjs_split = []
+    for i in range(mb_count):
+        if i < mb_count - 1:
+            sampled_adjs_mask = (sampled_adjs._indices()[1,:] >= ps_batch_sizes[i]) & \
+                                    (sampled_adjs._indices()[1,:] < ps_batch_sizes[i + 1])
+        else:
+            sampled_adjs_mask = (sampled_adjs._indices()[1,:] >= ps_batch_sizes[i]) & \
+                                    (sampled_adjs._indices()[1,:] < batch_sizes.sum().item())
+        sampled_adjs_indices_split = sampled_adjs._indices()[:, sampled_adjs_mask]
+        sampled_adjs_indices_split[1,:] -= sampled_adjs_indices_split[1,:].min().item()
+        sampled_adjs_values_split = sampled_adjs._values()[sampled_adjs_mask]
+        sampled_adjs_split.append(torch.sparse_coo_tensor(sampled_adjs_indices_split,
+                                                            sampled_adjs_values_split,
+                                                            torch.Size([batch_sizes[i], batch_sizes[i]])))
 
     if timing:
         for k, v in sorted(timing_dict.items()):
@@ -208,4 +208,5 @@ def shadow_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_tot
             else:
                 avg_time = -1.0
             print(f"{k} total_time: {sum(v)} avg_time {avg_time} len: {len(v)}")
-    return sampled_frontiers, sampled_adjs
+    # return sampled_frontiers, sampled_adjs
+    return sampled_frontiers_split, sampled_adjs_split

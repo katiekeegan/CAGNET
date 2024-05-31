@@ -612,6 +612,12 @@ def main(args, batches=None):
         num_features = 1
         num_classes = 2
 
+    proc_row = size // args.replication
+    rank_row = rank // args.replication
+    rank_col = rank % args.replication
+    if rank_row >= (size // args.replication):
+        return
+
     row_groups, col_groups = get_proc_groups(rank, size, args.replication)
 
     model = InteractionGNN(num_features,
@@ -670,6 +676,16 @@ def main(args, batches=None):
     components_small = LargestConnectedComponents(args.batch_size - 1)
     components_large = LargestConnectedComponents(args.batch_size)
 
+    row_n_bulkmb = int(args.n_bulkmb / (size / args.replication))
+    if rank == size - 1:
+        row_n_bulkmb = args.n_bulkmb - row_n_bulkmb * (proc_row - 1)
+
+    rank_n_bulkmb = int(row_n_bulkmb / args.replication)
+    if rank == size - 1:
+        rank_n_bulkmb = row_n_bulkmb - rank_n_bulkmb * (args.replication - 1)
+
+    print(f"rank_n_bulkmb: {rank_n_bulkmb}")
+
     dur = []
     for epoch in range(args.n_epochs):
         model.train()
@@ -723,58 +739,59 @@ def main(args, batches=None):
                                                                     col_groups, args.timing, \
                                                                     args.replicate_graph)
 
-            adj_matrices_bulk = adj_matrices_bulk.to_sparse_coo()
-
-            frontiers_bulk_cpu = frontiers_bulk.cpu()
-            edge_ids_cpu = adj_matrices_bulk._values().cpu()
             g_loc_coo = g_loc.to_sparse_coo()
-            print(f"edge_index: {adj_matrices_bulk._indices()}", flush=True)
-            batch = Batch(batch=frontiers_bulk, 
-                            edge_index=adj_matrices_bulk._indices(),
-                            y=trainset.y[edge_ids_cpu],
-                            z=trainset.z[frontiers_bulk_cpu],
-                            weights=trainset.weights[edge_ids_cpu])
-            print(f"batch: {batch}", flush=True)
-            # print(f"n_id: {n_id}", flush=True)
-            print(f"batch.batch: {batch.batch}", flush=True)
-            print(f"batch.edge_index: {batch.edge_index}", flush=True)
-            print(f"batch.y: {batch.y}", flush=True)
-            print(f"batch.z: {batch.z}", flush=True)
-            print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
 
-            # print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
-            batch = batch.cpu()
+            for i in range(args.n_bulkmb):
+                adj_matrix = adj_matrices_bulk[i].to_sparse_coo()
 
-            print(f"components_small: {components_small(batch)}", flush=True)
-            print(f"components_large: {components_large(batch)}", flush=True)
-            small_batch = components_small(batch).batch
-            large_batch = components_large(batch).batch
-            print(f"components_small.batch: {small_batch}", flush=True)
-            print(f"components_large.batch: {large_batch}", flush=True)
-            # missing_vtx = [i for i in large_batch if i not in small_batch]
-            # print(f"missing_vtx: {missing_vtx}", flush=True)
-            # unique_rows = batch.edge_index[0,:].unique()
-            # unique_cols = batch.edge_index[1,:].unique()
-            # print(f"unique_rows: {unique_rows}", flush=True)
-            # print(f"unique_cols: {unique_cols}", flush=True)
-            # print(f"unique_rows.size: {unique_rows.size()}", flush=True)
-            # print(f"unique_cols.size: {unique_cols.size()}", flush=True)
-            # unique_rows = unique_rows.cpu().numpy()
-            # unique_cols = unique_cols.cpu().numpy()
-            # print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
+                frontier_cpu = frontiers_bulk[i].cpu()
+                edge_ids_cpu = adj_matrix._values().cpu()
 
-            optimizer.zero_grad()
-            batch = batch.to(device)
-            logits = model(batch, epoch)
-            print(f"logits.sum: {logits.sum()}", flush=True)
-            loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
-            print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
-            # wandb.log({'loss': loss.item(),
-            #                 'pos_loss': pos_loss.item(), 
-            #                 'neg_loss': neg_loss.item(), 
-            #                 'epoch': epoch})
-            loss.backward()
-            optimizer.step()
+                batch = Batch(batch=frontiers_bulk[i], 
+                                edge_index=adj_matrices_bulk[i]._indices(),
+                                y=trainset.y[edge_ids_cpu],
+                                z=trainset.z[frontier_cpu],
+                                weights=trainset.weights[edge_ids_cpu])
+                # print(f"batch: {batch}", flush=True)
+                # print(f"n_id: {n_id}", flush=True)
+                # print(f"batch.batch: {batch.batch}", flush=True)
+                # print(f"batch.edge_index: {batch.edge_index}", flush=True)
+                # print(f"batch.y: {batch.y}", flush=True)
+                # print(f"batch.z: {batch.z}", flush=True)
+                # print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
+
+                # print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
+                # batch = batch.cpu()
+
+                # print(f"components_small: {components_small(batch)}", flush=True)
+                # print(f"components_large: {components_large(batch)}", flush=True)
+                # small_batch = components_small(batch).batch
+                # large_batch = components_large(batch).batch
+                # print(f"components_small.batch: {small_batch}", flush=True)
+                # print(f"components_large.batch: {large_batch}", flush=True)
+                # missing_vtx = [i for i in large_batch if i not in small_batch]
+                # print(f"missing_vtx: {missing_vtx}", flush=True)
+                # unique_rows = batch.edge_index[0,:].unique()
+                # unique_cols = batch.edge_index[1,:].unique()
+                # print(f"unique_rows: {unique_rows}", flush=True)
+                # print(f"unique_cols: {unique_cols}", flush=True)
+                # print(f"unique_rows.size: {unique_rows.size()}", flush=True)
+                # print(f"unique_cols.size: {unique_cols.size()}", flush=True)
+                # unique_rows = unique_rows.cpu().numpy()
+                # unique_cols = unique_cols.cpu().numpy()
+                # print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
+
+                optimizer.zero_grad()
+                batch = batch.to(device)
+                logits = model(batch, epoch)
+                loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
+                print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
+                # wandb.log({'loss': loss.item(),
+                #                 'pos_loss': pos_loss.item(), 
+                #                 'neg_loss': neg_loss.item(), 
+                #                 'epoch': epoch})
+                loss.backward()
+                optimizer.step()
 
         if epoch % 5 == 0:
             print(f"Evaluating", flush=True)

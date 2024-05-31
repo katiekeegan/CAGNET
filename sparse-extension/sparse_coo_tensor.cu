@@ -2880,7 +2880,9 @@ void reduce_sum_gpu(const at::Tensor& matc_crows, const at::Tensor& mata_crows,
 
 __global__ void ShadowColselect(long *sampled_frontiers, long *sampled_frontiers_rowids, 
                                     long *sampled_frontiers_crows, long *sampled_frontiers_cols,
-                                    long *adj_crows, long *adj_cols, long *mask, int nnz_col_count) { 
+                                    long *adj_crows, long *adj_cols, long *mask, long *ps_batch_sizes,
+                                    int batch_size, int nnz_col_count) { 
+
     int     id = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 
@@ -2892,10 +2894,11 @@ __global__ void ShadowColselect(long *sampled_frontiers, long *sampled_frontiers
         long adj_stop = adj_crows[i + 1];
         long sampled_start = sampled_frontiers_crows[row_id];
         long sampled_stop = sampled_frontiers_crows[row_id + 1];
+        long batch_id = row_id / batch_size;
         for (long j = adj_start; j < adj_stop; j++) {
             for (long k = sampled_start; k < sampled_stop; k++) {
                 if (adj_cols[j] == sampled_frontiers_cols[k]) {
-                    mask[j] = k;
+                    mask[j] = k - ps_batch_sizes[batch_id];
                     break;
                 }
             }
@@ -2907,10 +2910,15 @@ __global__ void ShadowColselect(long *sampled_frontiers, long *sampled_frontiers
 // shadow_colselect_gpu(sampled_frontiers, sampled_frontier_rowids, sampled_frontier_csr.crow_indices(),
 //                         sampled_frontier_csr.col_indices(), row_select_adj.crow_indices(), colselect_mask, 
 //                         sampled_frontiers.size(0), row_select_adj._nnz())
-void shadow_colselect_gpu(const at::Tensor& sampled_frontiers, const at::Tensor& sampled_frontiers_rowids,
-                            const at::Tensor& sampled_frontiers_crows, const at::Tensor& sampled_frontiers_cols,
-                            const at::Tensor& adj_crows, const at::Tensor& adj_cols, 
-                            const at::Tensor& colselect_mask, int nnz_col_count, int nnz_count) {
+void shadow_colselect_gpu(const at::Tensor& sampled_frontiers, 
+                            const at::Tensor& sampled_frontiers_rowids,
+                            const at::Tensor& sampled_frontiers_crows, 
+                            const at::Tensor& sampled_frontiers_cols,
+                            const at::Tensor& adj_crows, 
+                            const at::Tensor& adj_cols, 
+                            const at::Tensor& colselect_mask, 
+                            const at::Tensor& ps_batch_sizes,
+                            int batch_size, int nnz_col_count, int nnz_count) {
 
     int BLOCK_SIZE = 256;
     int BLOCK_COUNT = std::ceil(nnz_col_count / ((float) BLOCK_SIZE));
@@ -2928,6 +2936,8 @@ void shadow_colselect_gpu(const at::Tensor& sampled_frontiers, const at::Tensor&
                                                     adj_cols.data<long>(),
                                                     // colselect_mask.data<bool>(), 
                                                     colselect_mask.data<long>(), 
+                                                    ps_batch_sizes.data<long>(), 
+                                                    batch_size,
                                                     nnz_col_count);
 
     fflush(stdout);
