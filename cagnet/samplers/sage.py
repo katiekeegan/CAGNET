@@ -81,6 +81,7 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
     #                         size=(mb_count * batch_size, node_count_total))
     batches_expand = sparse_coo_tensor_gpu(batches_expand_idxs, batches._values(), 
                                             torch.Size([mb_count * batch_size, node_count_total]))
+    print(f"batches_expand: {batches_expand}", flush=True)
 
     if not replicate_graph:
         batches_expand = batches_expand.to_sparse_csr()
@@ -132,6 +133,7 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
                 current_frontier = current_frontier.to_sparse_csr()
             timing_dict["sage-startiter"].append(stop_time(start_timer, stop_timer))
 
+        print(f"current_frontier: {current_frontier}", flush=True)
         # Expand batches matrix
         p = gen_prob_dist(current_frontier, adj_matrix, mb_count, node_count_total,
                                 replication, rank, size, row_groups, col_groups,
@@ -191,6 +193,7 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
         next_frontier = sparse_coo_tensor_gpu(next_frontier_idxs, next_frontier_values, 
                                                 torch.Size([nnz_row, node_count_total]))
                                                 # torch.Size([nnz * mb_count, node_count_total]))
+        print(f"next_frontier: {next_frontier}", flush=True)
 
         # next_frontier = next_frontier.coalesce()
         # next_frontier_select = next_frontier._indices()[1,:].view(mb_count * nnz, frontier_size)

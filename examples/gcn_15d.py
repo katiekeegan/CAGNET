@@ -1073,7 +1073,7 @@ def main(args, batches=None):
     # return frontiers, adj_matrices, adj_matrix, col_groups
 
     # create GCN model
-    # torch.manual_seed(0)
+    torch.manual_seed(0)
     if args.sample_method == "sage":
         model = GCN(num_features,
                           args.n_hidden,
@@ -1104,8 +1104,8 @@ def main(args, batches=None):
 
     # use optimizer
     optimizer = torch.optim.Adam(model.parameters(), 
-                                    lr=args.lr * size)
-                                    # lr=args.lr * math.sqrt(size))
+                                    # lr=args.lr * size)
+                                    lr=args.lr * math.sqrt(size))
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                                     optimizer=optimizer, factor=0.8,
                                     patience=1000, verbose=True)
@@ -1252,6 +1252,7 @@ def main(args, batches=None):
                                                                         rank, size, row_groups, 
                                                                         col_groups, args.timing, args.baseline,
                                                                         args.replicate_graph)
+                print(f"adj_matrices_bulk: {adj_matrices_bulk}", flush=True)
                 # # Collect all matrices on rank 0
                 # if rank == 0:
                 #     frontiers0_recv = [frontiers_bulk[0]]
@@ -1343,6 +1344,7 @@ def main(args, batches=None):
                     src_select_max = (i + 1) * nnz_col
 
                     src_vtxs = frontiers_bulk[-1][src_select_min:src_select_max,:].view(-1)
+                    print(f"src_vtxs: {src_vtxs} src_vtxs.size: {src_vtxs.size()} src_vtxs.nnz.size: {src_vtxs.nonzero().squeeze().size()}", flush=True)
 
                     # print(f"i: {i} batch_vtxs: {batch_vtxs}", flush=True)
                     # frontiers_test[0][i] = frontiers_bulk[0][batch_select_min:batch_select_max,:]
@@ -1469,12 +1471,19 @@ def main(args, batches=None):
                             adj_sample_skip_cols += args.batch_size
                             adj_sample_skip_cols_feats = adj_sample_skip_cols
                         else:
-                            inc = args.batch_size
+                            # inc = args.batch_size
                             for adj in adjs:
                                 if adj is not None:
-                                    inc += adj._indices()[1,-1] + 1
+                                    # inc += adj._indices()[1,-1] + 1
+                                    inc = adj.size(1)
                             adj_sample_skip_cols += inc
-                            adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
+                            if l < args.n_layers - 1:
+                                adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
+                            else:
+                                adj_sample_skip_cols_feats = adj_sample_skip_cols
+                        print(f"before unique skip_cols.size: {adj_sample_skip_cols_feats.size()}", flush=True)
+                        # adj_sample_skip_cols_feats, skip_cols_counts = adj_sample_skip_cols_feats.unique(return_counts=True)
+                        # print(f"after unique skip_cols.size: {adj_sample_skip_cols_feats.size()} dupes: {adj_sample_skip_cols_feats[skip_cols_counts > 1]}", flush=True)
                         # print(f"adj_sample_skip_cols_feats: {adj_sample_skip_cols_feats}", flush=True)
                         # print(f"adj_sample_skip_cols_feats.size: {adj_sample_skip_cols_feats.size()}", flush=True)
                         # print(f"l: {l} adj_sample_cols: {adj_sample_cols} adj_sample_skip_cols: {adj_sample_skip_cols}", flush=True)
@@ -1564,6 +1573,7 @@ def main(args, batches=None):
                         features_mask = torch.cuda.BoolTensor(features_batch.size(0)).fill_(True)
                         # adj_sample_skip_cols += args.batch_size
                         # features_mask[adj_sample_skip_cols] = False
+                        print(f"adj_sample_skip_cols_feats.size: {adj_sample_skip_cols_feats.size()} features_batch.size: {features_batch.size()} adj_sample_skip_cols_feats: {adj_sample_skip_cols_feats}", flush=True)
                         features_mask[adj_sample_skip_cols_feats] = False
                         features_batch = features_batch[features_mask]
 
@@ -1578,10 +1588,12 @@ def main(args, batches=None):
                     #                                 size=(adjs[j].size(0), adjs[j].size(1) + args.batch_size))
                     for j in reversed(range(len(adjs))):
                         adjs_cols = adjs[j]._indices()[1,:]
+                        print(f"j: {j} before adjs_cols: {adjs_cols}", flush=True)
                         if j == len(adjs) - 1:
                             adjs_cols += args.batch_size
                         else:
                             adjs_cols += adjs[j + 1]._indices()[1,-1] + 1
+                        print(f"j: {j} after adjs_cols: {adjs_cols}", flush=True)
                         # adjs_cols += args.batch_size
                         adjs_indices = torch.stack((adjs[j]._indices()[0,:], adjs_cols))
                         adjs[j] = torch.sparse_coo_tensor(adjs_indices, adjs[j]._values(), 
@@ -1672,6 +1684,7 @@ def main(args, batches=None):
                 # adjs = [adj.to(rank) for adj in adjs]
                 # features_batch = features_loc[n_id]
                 optimizer.zero_grad()
+                print(f"adjs: {adjs} features: {features_batch} features.size: {features_batch.size()}", flush=True)
                 logits = model(adjs, features_batch, epoch)
                 torch.cuda.nvtx.range_pop() # nvtx-fwd
                 if epoch >= 1:

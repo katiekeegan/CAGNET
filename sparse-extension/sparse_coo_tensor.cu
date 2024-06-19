@@ -2605,7 +2605,7 @@ void rowselect_coo_gpu(std::vector<at::Tensor> nnz_cols, const at::Tensor& rows,
                                                 nnz_cols_counts.data<int>(),
                                                 row_count,
                                                 proc_count);
-    CHECK_ERROR("rowselect coo error")
+    CHECK_ERROR("rowselect_coo error")
 }
 
 // Per-process rowselect csr
@@ -2639,7 +2639,7 @@ void rowselect_csr_gpu(const at::Tensor& nnz_cols, const at::Tensor& row_offsets
                                                 row_offsets.data<long>(), 
                                                 mask.data<bool>(), 
                                                 nnz_col_count);
-    CHECK_ERROR("rowselect csr error")
+    CHECK_ERROR("rowselect_csr error")
 }
 
 __global__ void VtxTally(int *proc_tally, long *vtxs, int vtxs_count, int nodes_per_proc, int proc_count) { 
@@ -2880,7 +2880,7 @@ void reduce_sum_gpu(const at::Tensor& matc_crows, const at::Tensor& mata_crows,
                                                 matb_cols.data<long>(),
                                                 ROW_COUNT);
 
-    CHECK_ERROR("reduce sum error")
+    CHECK_ERROR("reduce_sum error")
 }
 
 __global__ void CurrCopy(long *curr_rows, 
@@ -2973,7 +2973,7 @@ void frontier_sum_gpu(const at::Tensor& curr_rows,
                                                     output_vals.data<float>(),
                                                     next_nnz, nnz_row, nnz_col, mb_count);
 
-    CHECK_ERROR("frontier sum error")
+    CHECK_ERROR("frontier_sum error")
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
