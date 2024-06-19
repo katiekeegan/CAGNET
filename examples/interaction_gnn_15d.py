@@ -41,7 +41,7 @@ import yaml
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
                                         aggr, rank, size, partitioning, replication, device, 
-                                        group=None, row_groups=None, col_groups=None):
+                                        group=None, row_groups=None, col_groups=None, impl="cagnet"):
         super(InteractionGNN, self).__init__()
         # self.layers = nn.ModuleList()
         self.nb_node_layer = nb_node_layer
@@ -57,6 +57,7 @@ class InteractionGNN(nn.Module):
         self.partitioning = partitioning
         self.replication = replication
         self.timings = dict()
+        self.impl = impl
 
         # torch.manual_seed(0)
         # aggr_list = ["sum", "mean", "max", "std"]
@@ -310,7 +311,7 @@ class InteractionGNN(nn.Module):
             batch.scores = scores.detach()
             test_batches.append(batch)
 
-        full_auc, masked_auc = graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", "cagnet")
+        full_auc, masked_auc = graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", self.impl)
         print(f"full_auc: {full_auc} type(full_auc): {type(full_auc)}", flush=True)
         print(f"masked_auc: {masked_auc} type(masked_auc): {type(masked_auc)}", flush=True)
         return full_auc, masked_auc
@@ -633,7 +634,8 @@ def main(args, batches=None):
                       args.replication,
                       device,
                       row_groups=row_groups,
-                      col_groups=col_groups)
+                      col_groups=col_groups,
+                      impl=args.impl)
     print(f"model: {model}", flush=True)
 
     model = model.to(device)
@@ -655,14 +657,15 @@ def main(args, batches=None):
                 )
 
     # torch.manual_seed(0)
-    train_loader = ShaDowKHopSampler(trainset, 
-                                        depth=args.n_layers, 
-                                        num_neighbors=args.num_neighbors, 
-                                        batch_size=args.batch_size, 
-                                        num_workers=16,
-                                        shuffle=False,
-                                        drop_last=True)
-    print(f"len(train_loader): {len(train_loader)}", flush=True)
+    if args.impl == "torch":
+        train_loader = ShaDowKHopSampler(trainset, 
+                                            depth=args.n_layers, 
+                                            num_neighbors=args.num_neighbors, 
+                                            batch_size=args.batch_size, 
+                                            num_workers=16,
+                                            shuffle=False,
+                                            drop_last=True)
+        print(f"len(train_loader): {len(train_loader)}", flush=True)
     test_loader = DataLoader(testset, batch_size=1, num_workers=1)
 
 
@@ -699,88 +702,8 @@ def main(args, batches=None):
         print(f"node_count: {node_count}", flush=True)
         print(f"batch_count: {batch_count}", flush=True)
 
-        # for batch, n_id in train_loader:
-        for b in range(0, batch_count, args.n_bulkmb):
-            if b + args.n_bulkmb >= batch_count:
-                break
-            batches_start = b * args.batch_size
-            batches_stop = (b + args.n_bulkmb) * args.batch_size
-            batches = batches_all[batches_start:batches_stop].view(args.n_bulkmb, args.batch_size)
-            batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
-
-            print(f"batches: {batches}", flush=True)
-            print(f"batches_loc: {batches_loc}", flush=True)
-            batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
-            batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
-            batches_indices_cols = batches_loc.view(-1)
-            batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
-            batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), device=device).fill_(1.0)
-            batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, (batches_loc.size(0), node_count))
-
-            node_count = trainset.x.size(0)
-            if args.n_darts == -1:
-                avg_degree = int(edge_count / node_count)
-                args.n_darts = []
-                avg_degree = edge_count / node_count
-                for d in range(args.n_layers):
-                    dart_count = int(avg_degree * args.samp_num / avg_degree)
-                    args.n_darts.append(dart_count)
-
-            if args.replicate_graph:
-                rep_pass = 1
-            else:
-                rep_pass = args.replication
-
-            frontiers_bulk, adj_matrices_bulk = shadow_sampler(g_loc, batches_loc, args.batch_size, \
-                                                                    [args.num_neighbors], args.n_bulkmb, \
-                                                                    # 2, args.n_darts, \
-                                                                    args.n_layers, args.n_darts, \
-                                                                    rep_pass, rank, size, row_groups, \
-                                                                    col_groups, args.timing, \
-                                                                    args.replicate_graph)
-
-            g_loc_coo = g_loc.to_sparse_coo()
-
-            for i in range(args.n_bulkmb):
-                adj_matrix = adj_matrices_bulk[i].to_sparse_coo()
-
-                frontier_cpu = frontiers_bulk[i].cpu()
-                edge_ids_cpu = adj_matrix._values().cpu()
-
-                batch = Batch(batch=frontiers_bulk[i], 
-                                edge_index=adj_matrices_bulk[i]._indices(),
-                                y=trainset.y[edge_ids_cpu],
-                                z=trainset.z[frontier_cpu],
-                                weights=trainset.weights[edge_ids_cpu])
-                # print(f"batch: {batch}", flush=True)
-                # print(f"n_id: {n_id}", flush=True)
-                # print(f"batch.batch: {batch.batch}", flush=True)
-                # print(f"batch.edge_index: {batch.edge_index}", flush=True)
-                # print(f"batch.y: {batch.y}", flush=True)
-                # print(f"batch.z: {batch.z}", flush=True)
-                # print(f"batch.weights.nonzero: {batch.weights.nonzero().squeeze()}", flush=True)
-
-                # print(f"batch.z[root_n_id] == trainset.z[root_n_id]: {(batch.z[batch.edge_index[1,:].cpu()] == trainset.z[batches_indices_cols.cpu()]).all()}", flush=True)
-                # batch = batch.cpu()
-
-                # print(f"components_small: {components_small(batch)}", flush=True)
-                # print(f"components_large: {components_large(batch)}", flush=True)
-                # small_batch = components_small(batch).batch
-                # large_batch = components_large(batch).batch
-                # print(f"components_small.batch: {small_batch}", flush=True)
-                # print(f"components_large.batch: {large_batch}", flush=True)
-                # missing_vtx = [i for i in large_batch if i not in small_batch]
-                # print(f"missing_vtx: {missing_vtx}", flush=True)
-                # unique_rows = batch.edge_index[0,:].unique()
-                # unique_cols = batch.edge_index[1,:].unique()
-                # print(f"unique_rows: {unique_rows}", flush=True)
-                # print(f"unique_cols: {unique_cols}", flush=True)
-                # print(f"unique_rows.size: {unique_rows.size()}", flush=True)
-                # print(f"unique_cols.size: {unique_cols.size()}", flush=True)
-                # unique_rows = unique_rows.cpu().numpy()
-                # unique_cols = unique_cols.cpu().numpy()
-                # print(f"row_col_intersect: {np.intersect1d(unique_rows, unique_cols).shape}", flush=True)
-
+        if args.impl == "torch":
+            for batch, n_id in train_loader:
                 optimizer.zero_grad()
                 batch = batch.to(device)
                 logits = model(batch, epoch)
@@ -792,6 +715,74 @@ def main(args, batches=None):
                 #                 'epoch': epoch})
                 loss.backward()
                 optimizer.step()
+
+        elif args.impl == "cagnet":
+            for b in range(0, batch_count, args.n_bulkmb):
+                if b + args.n_bulkmb >= batch_count:
+                    break
+                batches_start = b * args.batch_size
+                batches_stop = (b + args.n_bulkmb) * args.batch_size
+                batches = batches_all[batches_start:batches_stop].view(args.n_bulkmb, args.batch_size)
+                batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
+
+                print(f"batches: {batches}", flush=True)
+                print(f"batches_loc: {batches_loc}", flush=True)
+                batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
+                batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
+                batches_indices_cols = batches_loc.view(-1)
+                batches_indices = torch.stack((batches_indices_rows, batches_indices_cols))
+                batches_values = torch.cuda.FloatTensor(batches_loc.size(1) * batches_loc.size(0), 
+                                                            device=device).fill_(1.0)
+                batches_loc = torch.sparse_coo_tensor(batches_indices, batches_values, 
+                                                            (batches_loc.size(0), node_count))
+
+                node_count = trainset.x.size(0)
+                if args.n_darts == -1:
+                    avg_degree = int(edge_count / node_count)
+                    args.n_darts = []
+                    avg_degree = edge_count / node_count
+                    for d in range(args.n_layers):
+                        dart_count = int(avg_degree * args.samp_num / avg_degree)
+                        args.n_darts.append(dart_count)
+
+                if args.replicate_graph:
+                    rep_pass = 1
+                else:
+                    rep_pass = args.replication
+
+                frontiers_bulk, adj_matrices_bulk = shadow_sampler(g_loc, batches_loc, args.batch_size, \
+                                                                        [args.num_neighbors], args.n_bulkmb, \
+                                                                        # 2, args.n_darts, \
+                                                                        args.n_layers, args.n_darts, \
+                                                                        rep_pass, rank, size, row_groups, \
+                                                                        col_groups, args.timing, \
+                                                                        args.replicate_graph)
+
+                g_loc_coo = g_loc.to_sparse_coo()
+
+                for i in range(args.n_bulkmb):
+                    adj_matrix = adj_matrices_bulk[i].to_sparse_coo()
+
+                    frontier_cpu = frontiers_bulk[i].cpu()
+                    edge_ids_cpu = adj_matrix._values().cpu()
+
+                    batch = Batch(batch=frontiers_bulk[i], 
+                                    edge_index=adj_matrices_bulk[i]._indices(),
+                                    y=trainset.y[edge_ids_cpu],
+                                    z=trainset.z[frontier_cpu],
+                                    weights=trainset.weights[edge_ids_cpu])
+
+                    optimizer.zero_grad()
+                    batch = batch.to(device)
+                    logits = model(batch, epoch)
+                    loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
+                    print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
+                    # wandb.log({'loss': loss.item(),
+                    #                 'pos_loss': pos_loss.item(), 
+                    #                 'neg_loss': neg_loss.item(), 
+                    #                 'epoch': epoch})
+                    loss.backward()
+                    optimizer.step()
 
         if epoch % 5 == 0:
             print(f"Evaluating", flush=True)
@@ -876,6 +867,8 @@ if __name__ == '__main__':
                         help="number of hidden edge MLP layers")
     parser.add_argument("--n-graph-iters", type=int, default=8,
                         help="number of message passing iterations")
+    parser.add_argument('--impl', default='cagnet', type=str,
+                            help='sampling implementation to use (torch/cagnet)')
     args = parser.parse_args()
     args.samp_num = args.num_neighbors
     print(args)
