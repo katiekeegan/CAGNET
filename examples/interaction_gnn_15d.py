@@ -599,17 +599,47 @@ def main(args, batches=None):
 
         testset = GraphDataset(input_dir, "testset", 10, "fit", hparams)
         print(f"testset: {testset}", flush=True)
-        # g_loc = torch.sparse_coo_tensor(trainset.edge_index,
-        #                                     torch.cuda.FloatTensor(edge_count).fill_(1),
-        #                                     torch.Size([node_count, node_count]))
-        # edge_index_colsort, col_sort_idxs = trainset.edge_index[1, :].sort()
-        # edge_index_colsort = trainset.edge_index[:,col_sort_idxs]
-        # edge_index_rowsort, sort_idxs = edge_index_colsort[0,:].sort()
-        # edge_index_sort = edge_index_colsort[:, sort_idxs]
+        num_features = 1
+        num_classes = 2
+    elif args.dataset == "ctd":
+        print(f"Loading coo...", flush=True)
+        input_dir = "/global/cfs/cdirs/m4439/CTD2023_results/module_map/"
+        with open("gnn_train.yaml") as stream:
+            hparams = yaml.safe_load(stream)
 
-        # y_colsort = trainset.y[col_sort_idxs]
-        # y_sort = y_colsort[sort_idxs]
-        # g_loc = g_loc.to_sparse_csr()
+        print(f"hparams: {hparams}", flush=True)
+
+        dataset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
+
+        print(f"dataset: {dataset}", flush=True)
+        trainset = []
+        for data in dataset:
+            if data is None:
+                continue
+            data_obj = Data(hit_id=data["hit_id"],
+                                x=data["x"], 
+                                y=data["y"], 
+                                z=data["z"], 
+                                edge_index=data["edge_index"], 
+                                truth_map=data["truth_map"],
+                                weights=data["weights"])
+
+            # data_obj = dataset.preprocess_event(data_obj)
+            trainset.append(data_obj)
+        trainset = Batch.from_data_list(trainset)
+        # trainset = trainset.to(device)
+        print(f"trainset: {trainset}", flush=True)
+        print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
+        print(f"trainset.y.sum: {trainset.y.sum()}", flush=True)
+        print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
+        print(f"trainset.truth_map.sum: {trainset.truth_map.sum()}", flush=True)
+        print(f"trainset.weights.sum: {trainset.weights.sum()}", flush=True)
+
+        node_count = torch.max(trainset.edge_index) + 1
+        edge_count = trainset.edge_index.size(1)
+
+        testset = GraphDataset(input_dir, "testset", 200, "fit", hparams)
+        print(f"testset: {testset}", flush=True)
         num_features = 1
         num_classes = 2
 

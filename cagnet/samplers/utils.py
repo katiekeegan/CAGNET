@@ -1682,6 +1682,9 @@ class GraphDataset(Dataset):
 
     def get(self, idx):
         event_path = self.input_paths[idx]
+        print(f"event_path: {event_path}", flush=True)
+        if "event005000555.pyg" in event_path:
+            return None
         event = torch.load(event_path, map_location=torch.device("cpu"))
         # convert DataBatch to Data instance because some transformations don't work on DataBatch
         event = Data(**event.to_dict())
