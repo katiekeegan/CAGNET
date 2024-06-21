@@ -1477,10 +1477,10 @@ def main(args, batches=None):
                                     # inc += adj._indices()[1,-1] + 1
                                     inc = adj.size(1)
                             adj_sample_skip_cols += inc
-                            if l < args.n_layers - 1:
-                                adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
-                            else:
-                                adj_sample_skip_cols_feats = adj_sample_skip_cols
+                            # if l < args.n_layers - 1:
+                            adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
+                            # else:
+                            #     adj_sample_skip_cols_feats = adj_sample_skip_cols
                         print(f"before unique skip_cols.size: {adj_sample_skip_cols_feats.size()}", flush=True)
                         # adj_sample_skip_cols_feats, skip_cols_counts = adj_sample_skip_cols_feats.unique(return_counts=True)
                         # print(f"after unique skip_cols.size: {adj_sample_skip_cols_feats.size()} dupes: {adj_sample_skip_cols_feats[skip_cols_counts > 1]}", flush=True)

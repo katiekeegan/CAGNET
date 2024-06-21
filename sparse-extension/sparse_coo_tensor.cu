@@ -5,7 +5,7 @@
 #include <ATen/SparseTensorImpl.h>
 #include <ATen/NativeFunctions.h>
 #include <ATen/InitialTensorOptions.h>
-#include <ATen/SparseTensorUtils.h>
+#include <ATen/native/SparseTensorUtils.h>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -1583,7 +1583,7 @@ void spmm_gpu(const at::Tensor& A_rowindices,
                                                 &beta,                              // beta
                                                 matC,                               // matC
                                                 CUDA_R_32F,                         // computeType
-                                                CUSPARSE_CSRMM_ALG1,                // alg
+                                                CUSPARSE_SPMM_CSR_ALG2,                // alg
                                                 &bufferSize));                      // bufferSize
 
     void* d_buffer = NULL;
@@ -1598,7 +1598,7 @@ void spmm_gpu(const at::Tensor& A_rowindices,
                                     &beta,                              // beta
                                     matC,                               // matC
                                     CUDA_R_32F,                         // computeType
-                                    CUSPARSE_CSRMM_ALG1,                // alg
+                                    CUSPARSE_SPMM_CSR_ALG2,                // alg
                                     d_buffer));                         // buffer
 
 
