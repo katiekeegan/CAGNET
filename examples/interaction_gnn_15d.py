@@ -609,7 +609,9 @@ def main(args, batches=None):
 
         print(f"hparams: {hparams}", flush=True)
 
+        print(f"before graphdataset", flush=True)
         dataset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
+        print(f"after graphdataset", flush=True)
 
         print(f"dataset: {dataset}", flush=True)
         trainset = []
@@ -692,7 +694,7 @@ def main(args, batches=None):
                                             depth=args.n_layers, 
                                             num_neighbors=args.num_neighbors, 
                                             batch_size=args.batch_size, 
-                                            num_workers=16,
+                                            num_workers=1,
                                             shuffle=False,
                                             drop_last=True)
         print(f"len(train_loader): {len(train_loader)}", flush=True)

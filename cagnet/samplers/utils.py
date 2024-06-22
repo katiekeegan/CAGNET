@@ -1685,6 +1685,14 @@ class GraphDataset(Dataset):
         print(f"event_path: {event_path}", flush=True)
         if "event005000555.pyg" in event_path:
             return None
+        event_name = event_path.split("/")[-1]
+        event_id = int(event_name[5:event_name.index(".")])
+
+        if "CTD" in event_path:
+            event = torch.load(f"/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/{event_name}", map_location=torch.device("cpu"))
+            print(f"short circuited event: {event}", flush=True)
+            return event
+
         event = torch.load(event_path, map_location=torch.device("cpu"))
         # convert DataBatch to Data instance because some transformations don't work on DataBatch
         event = Data(**event.to_dict())
