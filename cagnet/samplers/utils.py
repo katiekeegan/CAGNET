@@ -1106,6 +1106,8 @@ def gen_prob_dist(numerator, adj_matrix, mb_count, node_count_total, replication
         # p_num_indices = torch.stack((p_num_rows, matc_chunk_cols))
         p_num_crows = matc_chunk_crows
         p_num_cols = matc_chunk_cols
+        print(f"p_num_crows: {p_num_crows}", flush=True)
+        print(f"p_num_cols: {p_num_cols}", flush=True)
         # p_num_values = torch.cuda.FloatTensor(p_num_indices.size(1)).fill_(1.0)
         # p_num_values = torch.cuda.DoubleTensor(p_num_indices.size(1)).fill_(1.0)
         p_num_values = torch.cuda.DoubleTensor(p_num_cols.size(0)).fill_(1.0)

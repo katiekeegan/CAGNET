@@ -1139,6 +1139,10 @@ def main(args, batches=None):
     #                                                 mode='UVA')
     # train_loader = torch.utils.data.DataLoader(train_nid, batch_size=args.batch_size, 
     #                                                 shuffle=True, drop_last=True)
+    
+    print(f"g_loc[6984334]: {g_loc.col_indices()[g_loc.crow_indices()[6984334]:g_loc.crow_indices()[6984334 + 1]]}", flush=True)
+    print(f"g_loc[15024053]: {g_loc.col_indices()[g_loc.crow_indices()[15024053]:g_loc.crow_indices()[15024053 + 1]]}", flush=True)
+    print(f"g_loc[70868272]: {g_loc.col_indices()[g_loc.crow_indices()[70868272]:g_loc.crow_indices()[70868272 + 1]]}", flush=True)
     for epoch in range(args.n_epochs):
         # train_loader_iter = iter(train_loader)
         print(f"Epoch: {epoch}", flush=True)
@@ -1465,7 +1469,7 @@ def main(args, batches=None):
                         # col_count = args.batch_size * np.prod(args.samp_num[:(l+1)], dtype=int)
                         col_count = nnz_row * args.samp_num[l]
                         adj_sample_skip_cols_prev = adj_sample_skip_cols
-                        adj_sample_skip_cols = torch.histc(adj_sample_cols, bins=col_count)
+                        adj_sample_skip_cols = torch.histc(adj_sample_cols, min=0, max=col_count - 1, bins=col_count)
                         adj_sample_skip_cols = (adj_sample_skip_cols == 0).nonzero().squeeze(1)
                         if l == 0:
                             adj_sample_skip_cols += args.batch_size
@@ -1477,10 +1481,10 @@ def main(args, batches=None):
                                     # inc += adj._indices()[1,-1] + 1
                                     inc = adj.size(1)
                             adj_sample_skip_cols += inc
-                            # if l < args.n_layers - 1:
-                            adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
-                            # else:
-                            #     adj_sample_skip_cols_feats = adj_sample_skip_cols
+                            if l < args.n_layers - 1:
+                                adj_sample_skip_cols_feats = torch.cat((adj_sample_skip_cols_prev, adj_sample_skip_cols))
+                            else:
+                                adj_sample_skip_cols_feats = adj_sample_skip_cols
                         print(f"before unique skip_cols.size: {adj_sample_skip_cols_feats.size()}", flush=True)
                         # adj_sample_skip_cols_feats, skip_cols_counts = adj_sample_skip_cols_feats.unique(return_counts=True)
                         # print(f"after unique skip_cols.size: {adj_sample_skip_cols_feats.size()} dupes: {adj_sample_skip_cols_feats[skip_cols_counts > 1]}", flush=True)
