@@ -609,26 +609,26 @@ def main(args, batches=None):
 
         print(f"hparams: {hparams}", flush=True)
 
-        print(f"before graphdataset", flush=True)
         dataset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
-        print(f"after graphdataset", flush=True)
+        
+        try:
+            trainset = torch.load("/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/trainset.pt")
+        except:
+            trainset = []
+            for data in dataset:
+                if data is None:
+                    continue
+                data_obj = Data(hit_id=data["hit_id"],
+                                    x=data["x"], 
+                                    y=data["y"], 
+                                    z=data["z"], 
+                                    edge_index=data["edge_index"], 
+                                    truth_map=data["truth_map"],
+                                    weights=data["weights"])
 
-        print(f"dataset: {dataset}", flush=True)
-        trainset = []
-        for data in dataset:
-            if data is None:
-                continue
-            data_obj = Data(hit_id=data["hit_id"],
-                                x=data["x"], 
-                                y=data["y"], 
-                                z=data["z"], 
-                                edge_index=data["edge_index"], 
-                                truth_map=data["truth_map"],
-                                weights=data["weights"])
-
-            # data_obj = dataset.preprocess_event(data_obj)
-            trainset.append(data_obj)
-        trainset = Batch.from_data_list(trainset)
+                # data_obj = dataset.preprocess_event(data_obj)
+                trainset.append(data_obj)
+            trainset = Batch.from_data_list(trainset)
         # trainset = trainset.to(device)
         print(f"trainset: {trainset}", flush=True)
         print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)

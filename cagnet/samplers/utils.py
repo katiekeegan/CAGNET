@@ -1690,7 +1690,6 @@ class GraphDataset(Dataset):
 
         if "CTD" in event_path:
             event = torch.load(f"/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/{event_name}", map_location=torch.device("cpu"))
-            print(f"short circuited event: {event}", flush=True)
             return event
 
         event = torch.load(event_path, map_location=torch.device("cpu"))
