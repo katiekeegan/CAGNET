@@ -19,6 +19,7 @@ from torch_geometric.loader import DataLoader, NeighborSampler, NeighborLoader
 # from torch_geometric.loader.shadow import ShaDowKHopSampler
 from shadow import ShaDowKHopSampler
 from torch_geometric.transforms import LargestConnectedComponents
+from torch_geometric.typing import SparseTensor
 from torch_geometric.utils import add_remaining_self_loops
 from torch_scatter import scatter_add
 import torch_sparse
@@ -41,7 +42,8 @@ import yaml
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
                                         aggr, rank, size, partitioning, replication, device, 
-                                        group=None, row_groups=None, col_groups=None, impl="cagnet"):
+                                        group=None, row_groups=None, col_groups=None, impl="cagnet",
+                                        dataset="physics_ex3"):
         super(InteractionGNN, self).__init__()
         # self.layers = nn.ModuleList()
         self.nb_node_layer = nb_node_layer
@@ -58,6 +60,7 @@ class InteractionGNN(nn.Module):
         self.replication = replication
         self.timings = dict()
         self.impl = impl
+        self.dataset = dataset
 
         # torch.manual_seed(0)
         # aggr_list = ["sum", "mean", "max", "std"]
@@ -217,7 +220,11 @@ class InteractionGNN(nn.Module):
 
     def forward(self, batch, epoch=0):
         x = torch.stack([batch["z"]], dim=-1).float()
-        src, dst = batch.edge_index
+        if batch.edge_index is not None:
+            src, dst = batch.edge_index
+        elif batch.adj_t is not None:
+            coo = batch.adj_t.coo()
+            src, dst = coo[0], coo[1]
         x.requires_grad = True
         x = self.node_encoder(x)
         e = self.edge_encoder(torch.cat([x[src], x[dst]], dim=-1))
@@ -311,7 +318,8 @@ class InteractionGNN(nn.Module):
             batch.scores = scores.detach()
             test_batches.append(batch)
 
-        full_auc, masked_auc = graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", self.impl)
+        filename = f"{self.impl}_{self.dataset}"
+        full_auc, masked_auc = graph_roc_curve("testset", test_batches, "Interaction GNN ROC curve", filename)
         print(f"full_auc: {full_auc} type(full_auc): {type(full_auc)}", flush=True)
         print(f"masked_auc: {masked_auc} type(masked_auc): {type(masked_auc)}", flush=True)
         return full_auc, masked_auc
@@ -565,7 +573,7 @@ def main(args, batches=None):
     elif args.dataset == "physics_ex3":
         print(f"Loading coo...", flush=True)
         input_dir = "/pscratch/sd/a/alokt/data_dir/Example_3/metric_learning/"
-        with open("gnn_train.yaml") as stream:
+        with open(f"gnn_train_{args.dataset}.yaml") as stream:
             hparams = yaml.safe_load(stream)
 
         print(f"hparams: {hparams}", flush=True)
@@ -601,10 +609,17 @@ def main(args, batches=None):
         print(f"testset: {testset}", flush=True)
         num_features = 1
         num_classes = 2
+
+        g_loc_indices = trainset.edge_index.to(device)
+        g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
+        g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
+        g_loc = g_loc.to_sparse_csr()
+        print(f"g_loc: {g_loc}", flush=True)
+
     elif args.dataset == "ctd":
         print(f"Loading coo...", flush=True)
         input_dir = "/global/cfs/cdirs/m4439/CTD2023_results/module_map/"
-        with open("gnn_train.yaml") as stream:
+        with open(f"gnn_train_{args.dataset}.yaml") as stream:
             hparams = yaml.safe_load(stream)
 
         print(f"hparams: {hparams}", flush=True)
@@ -612,7 +627,9 @@ def main(args, batches=None):
         dataset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
         
         try:
-            trainset = torch.load("/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/trainset.pt")
+            trainset = torch.load(
+                            "/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/trainset_t.pt"
+                       )
         except:
             trainset = []
             for data in dataset:
@@ -631,14 +648,32 @@ def main(args, batches=None):
             trainset = Batch.from_data_list(trainset)
         # trainset = trainset.to(device)
         print(f"trainset: {trainset}", flush=True)
+        print(f"before trainset.edge_index: {trainset.edge_index} dtype: {trainset.edge_index.dtype}", flush=True)
+        node_count = torch.max(trainset.edge_index) + 1
+        edge_count = trainset.edge_index.size(1)
+
+        # g_loc_indices = trainset.edge_index.to(device)
+        # g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
+        # g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
+        # g_loc = g_loc.to_sparse_csr()
+        # print(f"g_loc: {g_loc}", flush=True)
+
+        trainset.adj_t = SparseTensor(
+                                    row=trainset.edge_index[0,:], col=trainset.edge_index[1,:], 
+                                    value=torch.arange(trainset.edge_index.size(1)), 
+                                    is_sorted=True,
+                                    trust_data=True,
+                                    sparse_sizes=(node_count, node_count))
+        trainset.edge_index = None
+        print(f"after trainset.edge_index: {trainset.edge_index}", flush=True)
+        print(f"after trainset.adj_t: {trainset.adj_t}", flush=True)
+        # print(f"after trainset.edge_index row.dtype: {trainset.edge_index.row.dtype} col.dtype: {trainset.edge_index.col.dtype}", flush=True)
+        print(f"trainset: {trainset}", flush=True)
         print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
         print(f"trainset.y.sum: {trainset.y.sum()}", flush=True)
         print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
         print(f"trainset.truth_map.sum: {trainset.truth_map.sum()}", flush=True)
         print(f"trainset.weights.sum: {trainset.weights.sum()}", flush=True)
-
-        node_count = torch.max(trainset.edge_index) + 1
-        edge_count = trainset.edge_index.size(1)
 
         testset = GraphDataset(input_dir, "testset", 200, "fit", hparams)
         print(f"testset: {testset}", flush=True)
@@ -667,7 +702,8 @@ def main(args, batches=None):
                       device,
                       row_groups=row_groups,
                       col_groups=col_groups,
-                      impl=args.impl)
+                      impl=args.impl,
+                      dataset=args.dataset)
     print(f"model: {model}", flush=True)
 
     model = model.to(device)
@@ -690,23 +726,23 @@ def main(args, batches=None):
 
     # torch.manual_seed(0)
     if args.impl == "torch":
-        train_loader = ShaDowKHopSampler(trainset, 
-                                            depth=args.n_layers, 
-                                            num_neighbors=args.num_neighbors, 
-                                            batch_size=args.batch_size, 
-                                            num_workers=1,
-                                            shuffle=False,
-                                            drop_last=True)
+        print(f"before train_loader", flush=True)
+        # train_loader = ShaDowKHopSampler(trainset, 
+        #                                     depth=args.n_layers, 
+        #                                     num_neighbors=args.num_neighbors, 
+        #                                     batch_size=args.batch_size, 
+        #                                     num_workers=1,
+        #                                     shuffle=False,
+        #                                     drop_last=True)
+        train_loader = DataLoader(trainset, 
+				    batch_size=1, 
+				    num_workers=16,
+				    shuffle=False,
+				    drop_last=True)
+        print(f"after train_loader", flush=True)
         print(f"len(train_loader): {len(train_loader)}", flush=True)
+        trainset.edge_index = trainset.adj_t.coo()
     test_loader = DataLoader(testset, batch_size=1, num_workers=1)
-
-
-    g_loc_indices = trainset.edge_index.to(device)
-    # g_loc_values = torch.cuda.FloatTensor(g_loc_indices.size(1)).fill_(1.0)
-    g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
-    g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
-    g_loc = g_loc.to_sparse_csr()
-    print(f"g_loc: {g_loc}", flush=True)
 
     components_small = LargestConnectedComponents(args.batch_size - 1)
     components_large = LargestConnectedComponents(args.batch_size)
@@ -735,7 +771,9 @@ def main(args, batches=None):
         print(f"batch_count: {batch_count}", flush=True)
 
         if args.impl == "torch":
-            for batch, n_id in train_loader:
+            # for batch, n_id in train_loader:
+            for batch in train_loader:
+                print(f"batch: {batch}", flush=True)
                 optimizer.zero_grad()
                 batch = batch.to(device)
                 logits = model(batch, epoch)
