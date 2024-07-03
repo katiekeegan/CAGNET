@@ -41,14 +41,19 @@ import yaml
 
 class InteractionGNN(nn.Module):
     def __init__(self, in_feats, n_hidden, n_classes, nb_node_layer, nb_edge_layer, n_graph_iters, 
+                                        layernorm, batchnorm, hidden_activation, output_activation, 
                                         aggr, rank, size, partitioning, replication, device, 
-                                        group=None, row_groups=None, col_groups=None, impl="cagnet",
-                                        dataset="physics_ex3"):
+                                        group=None, row_groups=None, col_groups=None, 
+                                        impl="cagnet", dataset="physics_ex3"):
         super(InteractionGNN, self).__init__()
         # self.layers = nn.ModuleList()
         self.nb_node_layer = nb_node_layer
         self.nb_edge_layer = nb_edge_layer
         self.n_graph_iters = n_graph_iters
+        self.layernorm = layernorm
+        self.batchnorm = batchnorm
+        self.hidden_activation = hidden_activation
+        self.output_activation = output_activation
         self.aggr = aggr
         self.rank = rank
         self.size = size
@@ -71,19 +76,19 @@ class InteractionGNN(nn.Module):
         self.node_encoder = self.make_mlp(
             input_size=in_feats,
             sizes=[n_hidden] * nb_node_layer,
-            output_activation="Tanh",
-            hidden_activation="SiLU",
-            layer_norm=True,
-            batch_norm=False,
+            output_activation=output_activation,
+            hidden_activation=hidden_activation,
+            layer_norm=layernorm,
+            batch_norm=batchnorm,
         )
         
         self.edge_encoder = self.make_mlp(
             input_size=2 * n_hidden,
             sizes=[n_hidden] * nb_edge_layer,
-            output_activation="Tanh",
-            hidden_activation="SiLU",
-            layer_norm=True,
-            batch_norm=False,
+            output_activation=output_activation,
+            hidden_activation=hidden_activation,
+            layer_norm=layernorm,
+            batch_norm=batchnorm,
         )
         
         in_edge_net = n_hidden * 6
@@ -92,10 +97,10 @@ class InteractionGNN(nn.Module):
                 self.make_mlp(
                     input_size=in_edge_net,
                     sizes=[n_hidden] * nb_edge_layer,
-                    output_activation="Tanh",
-                    hidden_activation="SiLU",
-                    layer_norm=True,
-                    batch_norm=False,
+                    output_activation=output_activation,
+                    hidden_activation=hidden_activation,
+                    layer_norm=layernorm,
+                    batch_norm=batchnorm,
                 )
                 for i in range(n_graph_iters)
             ]
@@ -107,10 +112,10 @@ class InteractionGNN(nn.Module):
                 self.make_mlp(
                     input_size=in_node_net,
                     sizes=[n_hidden] * nb_node_layer,
-                    output_activation="Tanh",
-                    hidden_activation="SiLU",
-                    layer_norm=True,
-                    batch_norm=False,
+                    output_activation=output_activation,
+                    hidden_activation=hidden_activation,
+                    layer_norm=layernorm,
+                    batch_norm=batchnorm,
                 )
                 for i in range(n_graph_iters)
             ]
@@ -120,10 +125,10 @@ class InteractionGNN(nn.Module):
         self.edge_decoder = self.make_mlp(
             input_size=n_hidden,
             sizes=[n_hidden] * nb_edge_layer,
-            output_activation="Tanh",
-            hidden_activation="SiLU",
-            layer_norm=True,
-            batch_norm=False,
+            output_activation=output_activation,
+            hidden_activation=hidden_activation,
+            layer_norm=layernorm,
+            batch_norm=batchnorm,
         )
 
         # edge output transform layer
@@ -131,9 +136,9 @@ class InteractionGNN(nn.Module):
             input_size=n_hidden,
             sizes=[n_hidden, 1],
             output_activation=None,
-            hidden_activation="SiLU",
-            layer_norm=True,
-            batch_norm=False,
+            hidden_activation=hidden_activation,
+            layer_norm=layernorm,
+            batch_norm=batchnorm,
         )
 
         # dropout layer
@@ -200,6 +205,7 @@ class InteractionGNN(nn.Module):
         # Compute new node features
         edge_inputs = torch.cat([e, x[src], x[dst]], dim=-1)  # order dst src x ?
         e_updated = self.edge_network[i](edge_inputs)
+        print(f"edge_network: {self.edge_network}", flush=True)
         edge_messages_from_src = scatter_add(e_updated, dst, dim=0, dim_size=x.shape[0])
         edge_messages_from_dst = scatter_add(e_updated, src, dim=0, dim_size=x.shape[0])
 
@@ -207,6 +213,8 @@ class InteractionGNN(nn.Module):
             [edge_messages_from_src, edge_messages_from_dst, x], dim=-1
         )  # to check : the order dst src  x ?
         x_updated = self.node_network[i](node_inputs)
+        print(f"node_network: {self.node_network}", flush=True)
+        
         return (
             x_updated,
             e_updated,
@@ -223,6 +231,7 @@ class InteractionGNN(nn.Module):
         if batch.edge_index is not None:
             src, dst = batch.edge_index
         elif batch.adj_t is not None:
+            print(f"in adj_t else", flush=True)
             coo = batch.adj_t.coo()
             src, dst = coo[0], coo[1]
         x.requires_grad = True
@@ -237,7 +246,13 @@ class InteractionGNN(nn.Module):
             # if concat
             x = torch.cat([x, input_x], dim=-1)
             e = torch.cat([e, input_e], dim=-1)
+            print(f"in iter i: {i} x.size: {x.size()} e.size: {e.size()}", flush=True)
+            print(f"in iter i: {i} x.dtype: {x.dtype} e.dtype: {e.dtype}", flush=True)
             x, e, out = self.message_step(x, e, src, dst, i)
+            print(f"out.size: {out.size()}", flush=True)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            t = input("")
             outputs.append(out)
 
         return outputs[-1].squeeze(-1)
@@ -624,59 +639,82 @@ def main(args, batches=None):
 
         print(f"hparams: {hparams}", flush=True)
 
-        dataset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
         
-        try:
-            trainset = torch.load(
-                            "/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/trainset_t.pt"
-                       )
-        except:
-            trainset = []
-            for data in dataset:
-                if data is None:
-                    continue
-                data_obj = Data(hit_id=data["hit_id"],
-                                    x=data["x"], 
-                                    y=data["y"], 
-                                    z=data["z"], 
-                                    edge_index=data["edge_index"], 
-                                    truth_map=data["truth_map"],
-                                    weights=data["weights"])
+        # trainset = GraphDataset(input_dir, "trainset", 4053, "fit", hparams)
+        dataset = GraphDataset(input_dir, "trainset", 80, "fit", hparams)
+        trainset = []
+        for data in dataset:
+            if data is None:
+                continue
+            # data_obj = Data(hit_id=data["hit_id"],
+            #                     x=data["x"], 
+            #                     y=data["y"], 
+            #                     z=data["z"], 
+            #                     edge_index=data["edge_index"], 
+            #                     truth_map=data["truth_map"],
+            #                     weights=data["weights"])
+            data_obj = Data(hit_id=data["hit_id"],
+                                x=data["x"], 
+                                y=data["y"], 
+                                z=data["z"], 
+                                edge_index=data["edge_index"], 
+                                truth_map=data["truth_map"],
+                                weights=data["weights"],
+                                r=data["r"],
+                                phi=data["phi"],
+                                eta=data["eta"],
+                                cluster_r_1=data["cluster_r_1"],
+                                cluster_phi_1=data["cluster_phi_1"],
+                                cluster_z_1=data["cluster_z_1"],
+                                cluster_eta_1=data["cluster_eta_1"],
+                                cluster_r_2=data["cluster_r_2"],
+                                cluster_phi_2=data["cluster_phi_2"],
+                                cluster_z_2=data["cluster_z_2"],
+                                cluster_eta_2=data["cluster_eta_2"],
+                                dr=data["dr"],
+                                dphi=data["dphi"],
+                                dz=data["dz"],
+                                deta=data["deta"],
+                                phislope=data["phislope"],
+                                rphislope=data["rphislope"],
+                            )
 
-                # data_obj = dataset.preprocess_event(data_obj)
-                trainset.append(data_obj)
-            trainset = Batch.from_data_list(trainset)
+            # data_obj = dataset.preprocess_event(data_obj)
+            trainset.append(data_obj)
+        print(f"in except after loading", flush=True)
+        trainset = Batch.from_data_list(trainset)
         # trainset = trainset.to(device)
         print(f"trainset: {trainset}", flush=True)
-        print(f"before trainset.edge_index: {trainset.edge_index} dtype: {trainset.edge_index.dtype}", flush=True)
-        node_count = torch.max(trainset.edge_index) + 1
-        edge_count = trainset.edge_index.size(1)
 
-        # g_loc_indices = trainset.edge_index.to(device)
-        # g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
-        # g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
-        # g_loc = g_loc.to_sparse_csr()
-        # print(f"g_loc: {g_loc}", flush=True)
+        # print(f"before trainset.edge_index: {trainset.edge_index} dtype: {trainset.edge_index.dtype}", flush=True)
+        # node_count = torch.max(trainset.edge_index) + 1
+        # edge_count = trainset.edge_index.size(1)
 
-        trainset.adj_t = SparseTensor(
-                                    row=trainset.edge_index[0,:], col=trainset.edge_index[1,:], 
-                                    value=torch.arange(trainset.edge_index.size(1)), 
-                                    is_sorted=True,
-                                    trust_data=True,
-                                    sparse_sizes=(node_count, node_count))
-        trainset.edge_index = None
-        print(f"after trainset.edge_index: {trainset.edge_index}", flush=True)
-        print(f"after trainset.adj_t: {trainset.adj_t}", flush=True)
-        # print(f"after trainset.edge_index row.dtype: {trainset.edge_index.row.dtype} col.dtype: {trainset.edge_index.col.dtype}", flush=True)
-        print(f"trainset: {trainset}", flush=True)
-        print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
-        print(f"trainset.y.sum: {trainset.y.sum()}", flush=True)
-        print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
-        print(f"trainset.truth_map.sum: {trainset.truth_map.sum()}", flush=True)
-        print(f"trainset.weights.sum: {trainset.weights.sum()}", flush=True)
+        # # g_loc_indices = trainset.edge_index.to(device)
+        # # g_loc_values = torch.arange(g_loc_indices.size(1), dtype=torch.int64).to(device)
+        # # g_loc = torch.sparse_coo_tensor(g_loc_indices, g_loc_values)
+        # # g_loc = g_loc.to_sparse_csr()
+        # # print(f"g_loc: {g_loc}", flush=True)
 
-        testset = GraphDataset(input_dir, "testset", 200, "fit", hparams)
-        print(f"testset: {testset}", flush=True)
+        # trainset.adj_t = SparseTensor(
+        #                             row=trainset.edge_index[0,:], col=trainset.edge_index[1,:], 
+        #                             value=torch.arange(trainset.edge_index.size(1)), 
+        #                             is_sorted=True,
+        #                             trust_data=True,
+        #                             sparse_sizes=(node_count, node_count))
+        # trainset.edge_index = None
+        # print(f"after trainset.edge_index: {trainset.edge_index}", flush=True)
+        # print(f"after trainset.adj_t: {trainset.adj_t}", flush=True)
+        # # print(f"after trainset.edge_index row.dtype: {trainset.edge_index.row.dtype} col.dtype: {trainset.edge_index.col.dtype}", flush=True)
+        # print(f"trainset: {trainset}", flush=True)
+        # print(f"trainset.x.sum: {trainset.x.sum()}", flush=True)
+        # print(f"trainset.y.sum: {trainset.y.sum()}", flush=True)
+        # print(f"trainset.z.sum: {trainset.z.sum()}", flush=True)
+        # print(f"trainset.truth_map.sum: {trainset.truth_map.sum()}", flush=True)
+        # print(f"trainset.weights.sum: {trainset.weights.sum()}", flush=True)
+
+        # testset = GraphDataset(input_dir, "testset", 200, "fit", hparams)
+        # print(f"testset: {testset}", flush=True)
         num_features = 1
         num_classes = 2
 
@@ -686,7 +724,9 @@ def main(args, batches=None):
     if rank_row >= (size // args.replication):
         return
 
-    row_groups, col_groups = get_proc_groups(rank, size, args.replication)
+    # row_groups, col_groups = get_proc_groups(rank, size, args.replication)
+    row_groups = None
+    col_groups = None
 
     model = InteractionGNN(num_features,
                       args.n_hidden,
@@ -694,6 +734,10 @@ def main(args, batches=None):
                       args.nb_node_layer,
                       args.nb_edge_layer,
                       args.n_graph_iters,
+                      args.layernorm,
+                      args.batchnorm,
+                      args.hidden_activation,
+                      args.output_activation,
                       args.aggr,
                       rank,
                       size,
@@ -736,16 +780,16 @@ def main(args, batches=None):
         #                                     drop_last=True)
         train_loader = DataLoader(trainset, 
 				    batch_size=1, 
-				    num_workers=16,
+				    num_workers=1,
 				    shuffle=False,
 				    drop_last=True)
         print(f"after train_loader", flush=True)
         print(f"len(train_loader): {len(train_loader)}", flush=True)
-        trainset.edge_index = trainset.adj_t.coo()
-    test_loader = DataLoader(testset, batch_size=1, num_workers=1)
+        # trainset.edge_index = trainset.adj_t.coo()
+    # test_loader = DataLoader(testset, batch_size=1, num_workers=1)
 
-    components_small = LargestConnectedComponents(args.batch_size - 1)
-    components_large = LargestConnectedComponents(args.batch_size)
+    # components_small = LargestConnectedComponents(args.batch_size - 1)
+    # components_large = LargestConnectedComponents(args.batch_size)
 
     row_n_bulkmb = int(args.n_bulkmb / (size / args.replication))
     if rank == size - 1:
@@ -755,7 +799,10 @@ def main(args, batches=None):
     if rank == size - 1:
         rank_n_bulkmb = row_n_bulkmb - rank_n_bulkmb * (args.replication - 1)
 
-    print(f"rank_n_bulkmb: {rank_n_bulkmb}")
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print(f"before training", flush=True)
+    x = input()
 
     dur = []
     for epoch in range(args.n_epochs):
@@ -764,18 +811,16 @@ def main(args, batches=None):
         if epoch >= 1:
             epoch_start = time.time()
 
-        batches_all = torch.arange(node_count).to(device)
-        # batches_all = torch.randperm(node_count).to(device)
-        batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
-        print(f"node_count: {node_count}", flush=True)
-        print(f"batch_count: {batch_count}", flush=True)
-
         if args.impl == "torch":
             # for batch, n_id in train_loader:
             for batch in train_loader:
                 print(f"batch: {batch}", flush=True)
                 optimizer.zero_grad()
                 batch = batch.to(device)
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                print(f"before fwd", flush=True)
+                x = input()
                 logits = model(batch, epoch)
                 loss, pos_loss, neg_loss = model.loss_function(logits, batch)     
                 print(f"loss: {loss} pos_loss: {pos_loss} neg_loss: {neg_loss}", flush=True)
@@ -785,8 +830,16 @@ def main(args, batches=None):
                 #                 'epoch': epoch})
                 loss.backward()
                 optimizer.step()
+                del batch
+                del logits
 
         elif args.impl == "cagnet":
+            batches_all = torch.arange(node_count).to(device)
+            # batches_all = torch.randperm(node_count).to(device)
+            batch_count = -(node_count // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
+            print(f"node_count: {node_count}", flush=True)
+            print(f"batch_count: {batch_count}", flush=True)
+
             for b in range(0, batch_count, args.n_bulkmb):
                 if b + args.n_bulkmb >= batch_count:
                     break
@@ -937,6 +990,14 @@ if __name__ == '__main__':
                         help="number of hidden edge MLP layers")
     parser.add_argument("--n-graph-iters", type=int, default=8,
                         help="number of message passing iterations")
+    parser.add_argument('--batchnorm', action="store_true",
+                            help='use batchnorm in mlps')
+    parser.add_argument('--layernorm', action="store_true",
+                            help='use batchnorm in mlps')
+    parser.add_argument('--hidden-activation', choices=["SiLU", "ReLU", "Tanh"],
+                            help='hidden activation in mlps')
+    parser.add_argument('--output-activation', choices=["SiLU", "ReLU", "Tanh"],
+                            help='output activation in mlps')
     parser.add_argument('--impl', default='cagnet', type=str,
                             help='sampling implementation to use (torch/cagnet)')
     args = parser.parse_args()

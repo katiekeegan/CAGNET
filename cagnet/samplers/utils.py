@@ -1683,21 +1683,23 @@ class GraphDataset(Dataset):
     def get(self, idx):
         event_path = self.input_paths[idx]
         print(f"event_path: {event_path}", flush=True)
-        if "event005000555.pyg" in event_path:
-            return None
+        # if "event005000555.pyg" in event_path:
+        #     return None
         event_name = event_path.split("/")[-1]
         event_id = int(event_name[5:event_name.index(".")])
 
-        if "CTD" in event_path:
-            event = torch.load(f"/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/{event_name}", map_location=torch.device("cpu"))
-            return event
+        # if "CTD" in event_path:
+        #     event = torch.load(f"/global/cfs/cdirs/m1982/alokt/data/trackml/ctd/trainset_processed/{event_name}", map_location=torch.device("cpu"))
+        #     return event
 
         event = torch.load(event_path, map_location=torch.device("cpu"))
         # convert DataBatch to Data instance because some transformations don't work on DataBatch
         event = Data(**event.to_dict())
+        print(f"before preprocess event: {event}", flush=True)
         if not self.preprocess:
             return event
         event = self.preprocess_event(event)
+        print(f"after preprocess event: {event}", flush=True)
         # do pyg transformation if a torch_geometric.transforms instance is given
         if self.transform is not None:
             event = self.transform(event)
@@ -1886,6 +1888,7 @@ def load_datafiles_in_dir(input_dir, data_name=None, data_num=None):
         input_dir = os.path.join(input_dir, data_name)
 
     data_files = [str(path) for path in Path(input_dir).rglob("*.pyg")][:data_num]
+    print(f"data_files: {data_files}", flush=True)
     assert len(data_files) > 0, f"No data files found in {input_dir}"
     if data_num is not None:
         assert len(data_files) == data_num, (
@@ -1926,6 +1929,49 @@ def handle_hard_cuts(event, hard_cuts_config):
             and num_track_edges in event[track_feature].shape
         ):
             event[track_feature] = event[track_feature][..., true_track_mask]
+
+def reset_angle(angles):
+    angles[angles > torch.pi] = angles[angles > torch.pi] - 2 * torch.pi
+    angles[angles < -torch.pi] = angles[angles < -torch.pi] + 2 * torch.pi
+    return angles
+
+def handle_edge_features(event, edge_features):
+    src, dst = event.edge_index
+
+    for edge_feature in edge_features:
+        if "dr" in edge_features and not ("dr" in get_pyg_data_keys(event)):
+            event.dr = event.r[dst] - event.r[src]
+        if "dphi" in edge_features and not ("dphi" in get_pyg_data_keys(event)):
+            event.dphi = (
+                reset_angle((event.phi[dst] - event.phi[src]) * torch.pi) / torch.pi
+            )
+        if "dz" in edge_features and not ("dz" in get_pyg_data_keys(event)):
+            event.dz = event.z[dst] - event.z[src]
+        if "deta" in edge_features and not ("deta" in get_pyg_data_keys(event)):
+            event.deta = event.eta[dst] - event.eta[src]
+        if "phislope" in edge_features and not ("phislope" in get_pyg_data_keys(event)):
+            dr = event.r[dst] - event.r[src]
+            dphi = reset_angle((event.phi[dst] - event.phi[src]) * torch.pi) / torch.pi
+            phislope = dphi / dr
+            event.phislope = phislope
+        if "phislope" in edge_features:
+            event.phislope = torch.nan_to_num(
+                event.phislope, nan=0.0, posinf=100, neginf=-100
+            )
+            event.phislope = torch.clamp(event.phislope, -100, 100)
+        if "rphislope" in edge_features and not (
+            "rphislope" in get_pyg_data_keys(event)
+        ):
+            r_ = (event.r[dst] + event.r[src]) / 2.0
+            dr = event.r[dst] - event.r[src]
+            dphi = reset_angle((event.phi[dst] - event.phi[src]) * torch.pi) / torch.pi
+            phislope = dphi / dr
+            phislope = torch.nan_to_num(phislope, nan=0.0, posinf=100, neginf=-100)
+            phislope = torch.clamp(phislope, -100, 100)
+            rphislope = torch.multiply(r_, phislope)
+            event.rphislope = rphislope  # features / norm / pre_proc once
+        if "rphislope" in edge_features:
+            event.rphislope = torch.nan_to_num(event.rphislope, nan=0.0)
 
 def get_pyg_data_keys(event: Data):
     """
