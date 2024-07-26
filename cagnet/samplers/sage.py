@@ -88,7 +88,7 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
 
     # adj_matrix = adj_matrix.to_sparse_csr()
     current_frontier = batches_expand
-
+    # breakpoint()
     for i in range(n_layers):
         start_time(total_start_timer)
         # print(f"Sampling layer {i}", flush=True)
@@ -246,4 +246,5 @@ def sage_sampler(adj_matrix, batches, batch_size, frontier_sizes, mb_count_total
                 avg_time = -1.0
             print(f"{k} total_time: {sum(v)} avg_time {avg_time} len: {len(v)}")
     # return current_frontier_select, next_frontier_select, adj_matrices
+    breakpoint()
     return frontiers, adj_matrices

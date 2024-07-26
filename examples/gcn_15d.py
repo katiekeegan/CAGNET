@@ -21,7 +21,7 @@ import torch_sparse
 
 from cagnet.nn.conv import GCNConv
 from cagnet.partitionings import Partitioning
-from cagnet.samplers import ladies_sampler, sage_sampler
+from cagnet.samplers import ladies_sampler, sage_sampler, rwr_sampler, psg_sampler
 from cagnet.samplers.utils import *
 import cagnet.nn.functional as CAGF
 import torch.nn.functional as F
@@ -1050,6 +1050,19 @@ def main(args, batches=None):
                           device,
                           row_groups=row_groups,
                           col_groups=col_groups)
+    elif args.sample_method == "rwr" or args.sample_method == "psg":
+        model = GCN(num_features,
+                          args.n_hidden,
+                          num_classes,
+                          args.n_layers,
+                          args.aggr,
+                          rank,
+                          size,
+                          Partitioning.NONE,
+                          args.replication,
+                          device,
+                          row_groups=row_groups,
+                          col_groups=col_groups)
     elif args.sample_method == "ladies":
         model = LADIES(num_features,
                           args.n_hidden,
@@ -1112,6 +1125,7 @@ def main(args, batches=None):
         # print("Constructing batches", flush=True)
         torch.cuda.nvtx.range_push("nvtx-construct-batches")
         batch_count = -(train_nid.size(0) // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
+        # batch_count = args.n_bulkmb+1
         # if batches is None:
         torch.manual_seed(epoch)
         vertex_perm = torch.randperm(train_nid.size(0))
@@ -1119,7 +1133,8 @@ def main(args, batches=None):
         torch.cuda.nvtx.range_pop() # construct-batches
 
         # torch.cuda.nvtx.range_push("nvtx-construct-batches")
-        # batch_count = -(train_nid.size(0) // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
+        batch_count = -(train_nid.size(0) // -args.batch_size) # ceil(train_nid.size(0) / batch_size)
+        # batch_count =  args.nbulkmb
         # # print(f"batch_count: {batch_count}", flush=True)
         # if batches is None:
         #     torch.manual_seed(epoch)
@@ -1131,6 +1146,7 @@ def main(args, batches=None):
         last_batch = False
         print(f"batch_count: {batch_count}", flush=True)
         for b in range(0, batch_count, args.n_bulkmb):
+            # breakpoint()
             if b + args.n_bulkmb > batch_count:
                 break
                 last_batch = True
@@ -1140,10 +1156,13 @@ def main(args, batches=None):
                 args.batch_size = batch_count - b
             torch.cuda.nvtx.range_push("nvtx-partition-batches")
             batches = batches_all[b:(b + args.n_bulkmb * args.batch_size)].view(args.n_bulkmb, args.batch_size)
+            # breakpoint()
             if args.sample_method == "sage":
                 batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
             elif args.sample_method == "ladies":
                 batches_loc = one5d_partition_mb(rank, size, batches, args.replication, args.n_bulkmb)
+            elif args.sample_method == "rwr" or args.sample_method == "psg":
+                batches_loc = one5d_partition_mb(rank, size, batches, args.replication, args.n_bulkmb) # get seed nodes
 
             batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
             batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
@@ -1159,6 +1178,8 @@ def main(args, batches=None):
             if args.n_darts == -1:
                 avg_degree = int(edge_count / node_count)
                 if args.sample_method == "ladies":
+                    args.n_darts = avg_degree * args.batch_size * (args.replication ** 2)
+                if args.sample_method == "rwr" or args.sample_method == "psg":
                     args.n_darts = avg_degree * args.batch_size * (args.replication ** 2)
                 elif args.sample_method == "sage":
                     args.n_darts = []
@@ -1182,13 +1203,13 @@ def main(args, batches=None):
             torch.cuda.nvtx.range_push("nvtx-sampling")
             if args.sample_method == "ladies":
                 current_frontier, next_frontier, adj_matrices_bulk = \
-                                                ladies_sampler(g_loc, batches_loc, args.batch_size, \
+                                                ladies_sampler(g_loc, batches, args.batch_size, \
                                                                             args.samp_num, args.n_bulkmb, \
                                                                             args.n_layers, args.n_darts, \
                                                                             args.semibulk, args.replication, \
                                                                             nnz_row_masks, rank, size, 
                                                                             row_groups, col_groups, args.timing,
-                                                                            args.replicate_graph)
+                                                                             args.replicate_graph)
                 frontiers_bulk = [current_frontier, next_frontier]
             elif args.sample_method == "sage":
                 if nnz_row_masks is not None:
@@ -1204,7 +1225,38 @@ def main(args, batches=None):
                                                                         rank, size, row_groups, 
                                                                         col_groups, args.timing, args.baseline,
                                                                         args.replicate_graph)
-                
+                # breakpoint()
+            elif args.sample_method == "rwr":
+                if nnz_row_masks is not None:
+                    nnz_row_masks.fill_(False)
+                if args.replicate_graph:
+                    rep_pass = 1
+                else:
+                    rep_pass = args.replication
+                frontiers_bulk, adj_matrices_bulk,nodes = rwr_sampler(g_loc, batches_loc, args.batch_size, \
+                                                                        args.samp_num, args.n_bulkmb, \
+                                                                        args.n_layers, \
+                                                                        args.n_darts, \
+                                                                        rep_pass, nnz_row_masks, 
+                                                                        rank, size, row_groups, 
+                                                                        col_groups, args.timing, args.baseline,
+                                                                        args.replicate_graph)
+                # breakpoint()
+            elif args.sample_method == "psg":
+                if nnz_row_masks is not None:
+                    nnz_row_masks.fill_(False)
+                if args.replicate_graph:
+                    rep_pass = 1
+                else:
+                    rep_pass = args.replication
+                frontiers_bulk, adj_matrices_bulk,nodes = psg_sampler(g_loc, batches_loc, args.batch_size, \
+                                                                        args.samp_num, args.n_bulkmb, \
+                                                                        args.n_layers, \
+                                                                        args.n_darts, \
+                                                                        rep_pass, nnz_row_masks, 
+                                                                        rank, size, row_groups, 
+                                                                        col_groups, args.timing, args.baseline,
+                                                                        args.replicate_graph)
             if epoch >= 1:
                 model.timings["sample"].append(stop_time(start_timer, stop_timer, timing_arg=True))
             torch.cuda.nvtx.range_pop() # nvtx-sampling
@@ -1225,7 +1277,6 @@ def main(args, batches=None):
                     batch_select_size = args.batch_size
                     batch_select_min = i * args.batch_size 
                     batch_select_max = (i + 1) * args.batch_size
-
                     batch_vtxs = frontiers_bulk[0][batch_select_min:batch_select_max,:].view(-1)
 
                     src_select_min = i * args.batch_size * np.prod(args.samp_num[:-1], dtype=int)
@@ -1234,109 +1285,147 @@ def main(args, batches=None):
                 elif args.sample_method == "ladies":
                     batch_vtxs = frontiers_bulk[0][i]
                     src_vtxs = frontiers_bulk[-1][i]
-                
+                    print(src_vtxs)
+                elif args.sample_method == "rwr" or args.sample_method == "psg":
+                    batch_vtxs = frontiers_bulk[0].long().to(device)
+                    src_vtxs = frontiers_bulk[0].view(-1).long().to(device)
                 adjs = [None] * args.n_layers
                 adj_sample_skip_cols = None
                 for l in range(args.n_layers):
-                    # adj_row_select_min = i * args.batch_size * (args.samp_num ** l)
-                    # adj_row_select_max = (i + 1) * args.batch_size  * (args.samp_num ** l)
-                    adj_row_select_min = i * args.batch_size * np.prod(args.samp_num[:l], dtype=int)
-                    adj_row_select_max = (i + 1) * args.batch_size  * np.prod(args.samp_num[:l], dtype=int)
-                    adj_row_select_max = min(adj_row_select_max, adj_matrices_bulk[l].size(0))
+                    if args.sample_method == "rwr" or args.sample_method == "psg":
 
-                    if epoch >= 1:
-                        start_time(start_inner_timer, timing_arg=True)
+                        if epoch >= 1:
+                            start_time(start_inner_timer, timing_arg=True)
 
-                    adj_nnz_start = adj_matrices_bulk[l].crow_indices()[adj_row_select_min]
-                    adj_nnz_stop = adj_matrices_bulk[l].crow_indices()[adj_row_select_max]
+                        # Extract the crow_indices, col_indices, and values from the sparse CSR matrix
+                        crow_indices = adj_matrices_bulk[0].crow_indices()
+                        col_indices = adj_matrices_bulk[0].col_indices()
+                        values = adj_matrices_bulk[0].values()
 
-                    adj_sample_crows = adj_matrices_bulk[l].crow_indices()[adj_row_select_min:(adj_row_select_max+1)].clone()
-                    adj_sample_cols = adj_matrices_bulk[l].col_indices()[adj_nnz_start:adj_nnz_stop]
-                    crows_start = adj_sample_crows[0].item()
-                    adj_sample_crows -= crows_start
+                        # Create row indices for COO format
+                        row_indices = []
+                        for i in range(len(crow_indices) - 1):
+                            row_indices.extend([i] * (crow_indices[i + 1] - crow_indices[i]))
 
-                    adj_sample_values = adj_matrices_bulk[l].values()[adj_nnz_start:adj_nnz_stop].float()
+                        row_indices = torch.tensor(row_indices, device=adj_matrices_bulk[0].device)
 
-                    if epoch >= 1:
-                        model.timings["extract-select"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
+                        # Combine row and col indices into COO format
+                        coo_indices = torch.stack([row_indices, col_indices])
 
-                    if epoch >= 1:
-                        start_time(start_inner_timer, timing_arg=True)
-                    if args.sample_method == "ladies":
-                        adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
-                        row_count = adj_row_select_max - adj_row_select_min
-                        adj_sample_rows = torch.repeat_interleave(
-                                            torch.arange(0, row_count, 
-                                                            device=adj_sample_row_lens.device), 
-                                            adj_sample_row_lens)
-                        adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
-                        # adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
-                        #                                 adj_sample_values, \
-                        #                             # (args.batch_size * (args.samp_num ** l), \
-                        #                             #         args.batch_size * (args.samp_num ** (l + 1))))
-                        #                     (args.batch_size * np.prod(args.samp_num[:l], dtype=int), \
-                        #                         args.batch_size * (np.prod(args.samp_num[:(l+1)], dtype=int))))
-                        adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
-                                                        adj_sample_values, \
-                                                        (args.batch_size, args.samp_num[0] + args.batch_size))
-                                                        # (args.batch_size, args.samp_num + args.batch_size))
-                    else:
-                        # adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
-                        # row_count = adj_row_select_max - adj_row_select_min
-                        # adj_sample_rows = torch.repeat_interleave(
-                        #                     torch.arange(0, row_count, 
-                        #                                     device=adj_sample_row_lens.device), 
-                        #                     adj_sample_row_lens)
-                        # adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
-                        # adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
-                        #                                 adj_sample_values, \
-                        #                             # (args.batch_size * (args.samp_num ** l), \
-                        #                             #         args.batch_size * (args.samp_num ** (l + 1))))
-                        #                     (args.batch_size * np.prod(args.samp_num[:l], dtype=int), \
-                        #                         args.batch_size * (np.prod(args.samp_num[:(l+1)], dtype=int))))
-                        # adj_nnzs.append(adj_sample_values.size(0))
-                        if l > 0:
-                            adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
-                            # adj_sample_row_lens[adj_sample_skip_cols] = 0
-                            adj_sample_row_lens[adj_sample_skip_cols] = -1
-                            row_mask = adj_sample_row_lens > -1
-                            adj_sample_row_lens = adj_sample_row_lens[row_mask]
-                            row_count = adj_sample_row_lens.size(0)
-                            adj_sample_rows = torch.repeat_interleave(
-                                                torch.arange(0, row_count, 
-                                                                device=adj_sample_row_lens.device), 
-                                                adj_sample_row_lens)
-                            nnz_col_mask = torch.cuda.BoolTensor(adj_sample_crows[-1].item()).fill_(False)
-                            rowselect_csr_gpu(adj_sample_skip_cols, adj_sample_crows, nnz_col_mask, \
-                                                    adj_sample_skip_cols.size(0), adj_sample_crows[-1])
-                            adj_sample_values = adj_sample_values[~nnz_col_mask]
-                            adj_sample_cols = adj_sample_cols[~nnz_col_mask]
-                        else:
+                        # Create a sparse COO tensor
+                        adj_matrix_sample = torch.sparse_coo_tensor(coo_indices, values, adj_matrices_bulk[0].size(), device=adj_matrices_bulk[0].device)
+                    else: 
+                        # adj_row_select_min = i * args.batch_size * (args.samp_num ** l)
+                        # adj_row_select_max = (i + 1) * args.batch_size  * (args.samp_num ** l)
+                        adj_row_select_min = i * args.batch_size * np.prod(args.samp_num[:l], dtype=int)
+                        adj_row_select_max = (i + 1) * args.batch_size  * np.prod(args.samp_num[:l], dtype=int)
+                        adj_row_select_max = min(adj_row_select_max, adj_matrices_bulk[l].size(0))
+
+                        if epoch >= 1:
+                            start_time(start_inner_timer, timing_arg=True)
+
+                        adj_nnz_start = adj_matrices_bulk[l].crow_indices()[adj_row_select_min]
+                        adj_nnz_stop = adj_matrices_bulk[l].crow_indices()[adj_row_select_max]
+
+                        adj_sample_crows = adj_matrices_bulk[l].crow_indices()[adj_row_select_min:(adj_row_select_max+1)].clone()
+                        adj_sample_cols = adj_matrices_bulk[l].col_indices()[adj_nnz_start:adj_nnz_stop]
+                        crows_start = adj_sample_crows[0].item()
+                        adj_sample_crows -= crows_start
+
+                        adj_sample_values = adj_matrices_bulk[l].values()[adj_nnz_start:adj_nnz_stop].float()
+
+                        if epoch >= 1:
+                            model.timings["extract-select"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
+
+                        if epoch >= 1:
+                            start_time(start_inner_timer, timing_arg=True)
+                        if args.sample_method == "ladies":
                             adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
                             row_count = adj_row_select_max - adj_row_select_min
                             adj_sample_rows = torch.repeat_interleave(
                                                 torch.arange(0, row_count, 
                                                                 device=adj_sample_row_lens.device), 
                                                 adj_sample_row_lens)
+                            adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
+                            # adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
+                            #                                 adj_sample_values, \
+                            #                             # (args.batch_size * (args.samp_num ** l), \
+                            #                             #         args.batch_size * (args.samp_num ** (l + 1))))
+                            #                     (args.batch_size * np.prod(args.samp_num[:l], dtype=int), \
+                            #                         args.batch_size * (np.prod(args.samp_num[:(l+1)], dtype=int))))
+                            # Debugging output to verify indices and sizes
+                            print(f'adj_sample_indices.shape: {adj_sample_indices.shape}')
+                            print(f'adj_sample_indices: {adj_sample_indices}')
+                            print(f'adj_sample_values.shape: {adj_sample_values.shape}')
+                            print(f'adj_sample_values: {adj_sample_values}')
+                            # if args.sample_method == "rwr":
+                            #     adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
+                            #                                 adj_sample_values, \
+                            #                                 (args.batch_size, args.batch_size))
+                            # else:
+                            adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
+                                                            adj_sample_values, \
+                                                            (args.batch_size, args.samp_num[0] + args.batch_size))
+                                                            # (args.batch_size, args.samp_num + args.batch_size))
+                            
+                        else:
+                            # adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
+                            # row_count = adj_row_select_max - adj_row_select_min
+                            # adj_sample_rows = torch.repeat_interleave(
+                            #                     torch.arange(0, row_count, 
+                            #                                     device=adj_sample_row_lens.device), 
+                            #                     adj_sample_row_lens)
+                            # adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
+                            # adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
+                            #                                 adj_sample_values, \
+                            #                             # (args.batch_size * (args.samp_num ** l), \
+                            #                             #         args.batch_size * (args.samp_num ** (l + 1))))
+                            #                     (args.batch_size * np.prod(args.samp_num[:l], dtype=int), \
+                            #                         args.batch_size * (np.prod(args.samp_num[:(l+1)], dtype=int))))
+                            # adj_nnzs.append(adj_sample_values.size(0))
+                            if l > 0:
+                                adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
+                                # adj_sample_row_lens[adj_sample_skip_cols] = 0
+                                adj_sample_row_lens[adj_sample_skip_cols] = -1
+                                row_mask = adj_sample_row_lens > -1
+                                adj_sample_row_lens = adj_sample_row_lens[row_mask]
+                                row_count = adj_sample_row_lens.size(0)
+                                adj_sample_rows = torch.repeat_interleave(
+                                                    torch.arange(0, row_count, 
+                                                                    device=adj_sample_row_lens.device), 
+                                                    adj_sample_row_lens)
+                                nnz_col_mask = torch.cuda.BoolTensor(adj_sample_crows[-1].item()).fill_(False)
+                                rowselect_csr_gpu(adj_sample_skip_cols, adj_sample_crows, nnz_col_mask, \
+                                                        adj_sample_skip_cols.size(0), adj_sample_crows[-1])
+                                adj_sample_values = adj_sample_values[~nnz_col_mask]
+                                adj_sample_cols = adj_sample_cols[~nnz_col_mask]
+                            else:
+                                adj_sample_row_lens = adj_sample_crows[1:] - adj_sample_crows[:-1]
+                                row_count = adj_row_select_max - adj_row_select_min
+                                adj_sample_rows = torch.repeat_interleave(
+                                                    torch.arange(0, row_count, 
+                                                                    device=adj_sample_row_lens.device), 
+                                                    adj_sample_row_lens)
 
-                        # frontier_nnz_sizes = torch.histc(next_frontier._indices()[0,next_frontier_nnz], bins=p.size(0))
-                        # row_count = args.batch_size * np.prod(args.samp_num[:l], dtype=int)
-                        col_count = args.batch_size * np.prod(args.samp_num[:(l+1)], dtype=int)
-                        adj_sample_skip_cols = torch.histc(adj_sample_cols, bins=col_count)
-                        adj_sample_skip_cols = (adj_sample_skip_cols == 0).nonzero().squeeze(1)
-                        # print(f"l: {l} adj_sample_cols: {adj_sample_cols} adj_sample_skip_cols: {adj_sample_skip_cols}", flush=True)
-                        col_count = args.batch_size * np.prod(args.samp_num[:(l+1)], dtype=int) - \
-                                        adj_sample_skip_cols.size(0)
-                        adj_sample_cols = torch.arange(0, adj_sample_values.size(0), device=device, dtype=int)
-                        # print(f"adj_sample_skip_cols: {adj_sample_skip_cols}", flush=True)
-                        # print(f"adj_sample_cols: {adj_sample_cols}", flush=True)
-                        adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
-                        adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
-                                                        adj_sample_values, (row_count, col_count))
-                                                    # (args.batch_size * (args.samp_num ** l), \
-                                                    #         args.batch_size * (args.samp_num ** (l + 1))))
-                        adj_nnzs.append(adj_sample_values.size(0))
-                        # print(f"i: {i} sample.nnz: {adj_matrix_sample._nnz()} sample.size: {adj_matrix_sample.size()} emptyrows: {(adj_sample_row_lens == 0).sum()}")
+                            # frontier_nnz_sizes = torch.histc(next_frontier._indices()[0,next_frontier_nnz], bins=p.size(0))
+                            # row_count = args.batch_size * np.prod(args.samp_num[:l], dtype=int)
+                            col_count = args.batch_size * np.prod(args.samp_num[:(l+1)], dtype=int)
+                            adj_sample_skip_cols = torch.histc(adj_sample_cols, bins=col_count)
+                            adj_sample_skip_cols = (adj_sample_skip_cols == 0).nonzero().squeeze(1)
+                            # print(f"l: {l} adj_sample_cols: {adj_sample_cols} adj_sample_skip_cols: {adj_sample_skip_cols}", flush=True)
+                            col_count = args.batch_size * np.prod(args.samp_num[:(l+1)], dtype=int) - \
+                                            adj_sample_skip_cols.size(0)
+                            adj_sample_cols = torch.arange(0, adj_sample_values.size(0), device=device, dtype=int)
+                            # print(f"adj_sample_skip_cols: {adj_sample_skip_cols}", flush=True)
+                            # print(f"adj_sample_cols: {adj_sample_cols}", flush=True)
+                            adj_sample_indices = torch.stack((adj_sample_rows, adj_sample_cols))
+                            adj_matrix_sample = torch.sparse_coo_tensor(adj_sample_indices, \
+                                                            adj_sample_values, (row_count, col_count))
+                                                        # (args.batch_size * (args.samp_num ** l), \
+                                                        #         args.batch_size * (args.samp_num ** (l + 1))))
+                            adj_nnzs.append(adj_sample_values.size(0))
+                            # print(f"i: {i} sample.nnz: {adj_matrix_sample._nnz()} sample.size: {adj_matrix_sample.size()} emptyrows: {(adj_sample_row_lens == 0).sum()}")
+                        
                     if epoch >= 1:
                         model.timings["extract-inst"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
 
@@ -1348,7 +1437,6 @@ def main(args, batches=None):
                     # print(f"l: {l} {adjs[args.n_layers - l- 1]}")
                     if epoch >= 1:
                         model.timings["extract-coalesce"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
-
                 torch.cuda.nvtx.range_pop() # nvtx-extracting
                 if epoch >= 1:
                     start_time(start_inner_timer, timing_arg=True)
@@ -1369,8 +1457,12 @@ def main(args, batches=None):
                     # sort_dst_proc_gpu(src_vtxs, src_vtxs_sort, og_idxs, tally, node_per_proc)
                     sort_dst_proc_gpu(src_vtxs, src_vtxs_sort, og_idxs, tally, 
                                         node_per_row, proc_row)
-
+                    # Check tensor shapes and values before the operation
+                    print(f"src_vtxs_sort.shape: {src_vtxs_sort.shape}, src_vtxs_sort[:10]: {src_vtxs_sort[:10]}")
+                    print(f"og_idxs.shape: {og_idxs.shape}, og_idxs[:10]: {og_idxs[:10]}")
+                    print(f"tally: {tally}")
                     src_vtxs_sort_nnz = src_vtxs_sort != 0
+                    print(f"src_vtxs_sort_nnz.shape: {src_vtxs_sort_nnz.shape}, src_vtxs_sort_nnz[:10]: {src_vtxs_sort_nnz[:10]}")
                     tally[0] -= (src_vtxs_sort == 0).sum()
                     src_vtxs_sort = src_vtxs_sort[src_vtxs_sort_nnz]
                     og_idxs_nnz = og_idxs[src_vtxs_sort_nnz]
@@ -1411,7 +1503,6 @@ def main(args, batches=None):
                         features_mask = torch.cuda.BoolTensor(features_batch.size(0)).fill_(True)
                         features_mask[adj_sample_skip_cols] = False
                         features_batch = features_batch[features_mask]
-
                 torch.cuda.nvtx.range_pop() # nvtx-selectfeats
                 if epoch >= 1:
                     model.timings["selectfeats"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
@@ -1470,7 +1561,10 @@ def main(args, batches=None):
                     start_time(start_inner_timer)
                 torch.cuda.nvtx.range_push("nvtx-loss")
                 # loss = F.nll_loss(logits, data.y[batch_vtxs].long()) # GCNConv
-                loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
+                if args.sample_method == "rwr" or args.sample_method == "psg":
+                    loss = F.nll_loss(logits,data.y[src_vtxs].long())
+                else:
+                    loss = F.nll_loss(logits[:args.batch_size], data.y[batch_vtxs].long()) # SAGEConv
                 # loss = F.nll_loss(logits[:args.batch_size], data.y[seeds].long()) # quiver
 
                 torch.cuda.nvtx.range_pop() # nvtx-loss
@@ -1505,6 +1599,7 @@ def main(args, batches=None):
                 args.batch_size = tmp_batch_size
 
             torch.cuda.nvtx.range_pop() # nvtx-training
+        # # breakpoint()
         for i in range(len(frontiers_bulk)):
             del frontiers_bulk[0]
         del frontiers_bulk
@@ -1571,8 +1666,19 @@ def main(args, batches=None):
                 model = model.to(device)
                 print("Rank: {:05d} | Epoch: {:05d} | Time(s): {:.4f} | Loss: {:.4f} | Accuracy: {:.4f}".format(rank, epoch, np.sum(dur), loss.item(), acc3), flush=True)
             else:
-                print("Rank: {:05d} | Epoch: {:05d} | Time(s): {:.4f} | Accuracy: {:.4f}".format(rank, epoch, np.sum(dur), acc3), flush=True)
-
+                model = model.cpu()
+                train_nid = train_nid.cpu()
+                test_nid = test_nid.cpu()
+                out = model.evaluate(adj_matrix, inputs, test_nid, data.y)
+                # correct_count = model.evaluate(adj_matrix, inputs, test_nid, data.y.cpu())
+                res = out.argmax(dim=-1) == data.y.cpu()
+                # acc1 = int(res[train_nid].sum()) / train_nid.size(0)
+                acc3 = int(res[test_nid].sum()) / test_nid.size(0)
+                # acc3 = correct_count / test_nid.size(0)
+                train_nid = train_nid.to(device)
+                test_nid = test_nid.to(device)
+                model = model.to(device)
+                print("Rank: {:05d} | Epoch: {:05d} | Time(s): {:.4f} | Loss: {:.4f} | Accuracy: {:.4f}".format(rank, epoch, np.sum(dur), loss.item(), acc3), flush=True)
         dist.barrier() 
                 
     total_stop = time.time()

@@ -109,4 +109,5 @@ def ladies_sampler(adj_matrix, batches, batch_size, frontier_size, mb_count_tota
             else:
                 avg_time = -1.0
             print(f"{k} total_time: {sum(v)} avg_time {avg_time} len: {len(v)}")
+    breakpoint()
     return batches_select, next_frontier_select, adj_matrices
