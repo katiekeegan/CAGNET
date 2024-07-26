@@ -21,7 +21,7 @@ import torch_sparse
 
 from cagnet.nn.conv import GCNConv
 from cagnet.partitionings import Partitioning
-from cagnet.samplers import ladies_sampler, sage_sampler, rwr_sampler
+from cagnet.samplers import ladies_sampler, sage_sampler
 from cagnet.samplers.utils import *
 import cagnet.nn.functional as CAGF
 import torch.nn.functional as F
@@ -1050,19 +1050,6 @@ def main(args, batches=None):
                           device,
                           row_groups=row_groups,
                           col_groups=col_groups)
-    elif args.sample_method == "rwr":
-        model = GCN(num_features,
-                          args.n_hidden,
-                          num_classes,
-                          args.n_layers,
-                          args.aggr,
-                          rank,
-                          size,
-                          Partitioning.NONE,
-                          args.replication,
-                          device,
-                          row_groups=row_groups,
-                          col_groups=col_groups)
     elif args.sample_method == "ladies":
         model = LADIES(num_features,
                           args.n_hidden,
@@ -1157,8 +1144,6 @@ def main(args, batches=None):
                 batches_loc = one5d_partition_mb(rank, size, batches, 1, args.n_bulkmb)
             elif args.sample_method == "ladies":
                 batches_loc = one5d_partition_mb(rank, size, batches, args.replication, args.n_bulkmb)
-            elif args.sample_method == "rwr":
-                batches_loc = one5d_partition_mb(rank, size, batches, args.replication, args.n_bulkmb) # get seed nodes
 
             batches_indices_rows = torch.arange(batches_loc.size(0), dtype=torch.int32, device=device)
             batches_indices_rows = batches_indices_rows.repeat_interleave(batches_loc.size(1))
@@ -1220,22 +1205,6 @@ def main(args, batches=None):
                                                                         col_groups, args.timing, args.baseline,
                                                                         args.replicate_graph)
                 
-            elif args.sample_method == "rwr":
-                if nnz_row_masks is not None:
-                    nnz_row_masks.fill_(False)
-                if args.replicate_graph:
-                    rep_pass = 1
-                else:
-                    rep_pass = args.replication
-                frontiers_bulk, adj_matrices_bulk = rwr_sampler(g_loc, batches_loc, args.batch_size, \
-                                                                        args.samp_num, args.n_bulkmb, \
-                                                                        args.n_layers, \
-                                                                        args.n_darts, \
-                                                                        rep_pass, nnz_row_masks, 
-                                                                        rank, size, row_groups, 
-                                                                        col_groups, args.timing, args.baseline,
-                                                                        args.replicate_graph)
-                
             if epoch >= 1:
                 model.timings["sample"].append(stop_time(start_timer, stop_timer, timing_arg=True))
             torch.cuda.nvtx.range_pop() # nvtx-sampling
@@ -1262,22 +1231,10 @@ def main(args, batches=None):
                     src_select_min = i * args.batch_size * np.prod(args.samp_num[:-1], dtype=int)
                     src_select_max = (i + 1) * args.batch_size  * np.prod(args.samp_num[:-1], dtype=int)
                     src_vtxs = frontiers_bulk[-1][src_select_min:src_select_max,:].view(-1)
-                    breakpoint()
                 elif args.sample_method == "ladies":
                     batch_vtxs = frontiers_bulk[0][i]
                     src_vtxs = frontiers_bulk[-1][i]
-                    print(src_vtxs)
-                elif args.sample_method == "rwr":
-                    batch_select_size = args.batch_size
-                    batch_select_min = i * args.batch_size 
-                    batch_select_max = (i + 1) * args.batch_size
-
-                    batch_vtxs = frontiers_bulk[0][batch_select_min:batch_select_max,:].view(-1)
-
-                    src_select_min = i * args.batch_size * np.prod(args.samp_num[:-1], dtype=int)
-                    src_select_max = (i + 1) * args.batch_size  * np.prod(args.samp_num[:-1], dtype=int)
-                    src_vtxs = frontiers_bulk[-1][src_select_min:src_select_max,:].view(-1)
-                    print(src_vtxs)
+                
                 adjs = [None] * args.n_layers
                 adj_sample_skip_cols = None
                 for l in range(args.n_layers):
@@ -1454,6 +1411,7 @@ def main(args, batches=None):
                         features_mask = torch.cuda.BoolTensor(features_batch.size(0)).fill_(True)
                         features_mask[adj_sample_skip_cols] = False
                         features_batch = features_batch[features_mask]
+
                 torch.cuda.nvtx.range_pop() # nvtx-selectfeats
                 if epoch >= 1:
                     model.timings["selectfeats"].append(stop_time(start_inner_timer, stop_inner_timer, timing_arg=True))
